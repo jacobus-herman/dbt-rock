@@ -39,6 +39,9 @@ parts:
       - base-passwd_data
       - ca-certificates_data
       - base-files_release-info
+      # writes /var/lib/chisel/manifest.yaml: the machine-readable record of
+      # exactly which packages/slices were cut into this rock (SBOM/audit)
+      - base-files_chisel
     override-build: |
       # release tarballs are per-arch; checksums from the release's SHA256SUMS
       case "$CRAFT_ARCH_BUILD_FOR" in
@@ -68,7 +71,6 @@ parts:
       find "$CRAFT_PART_INSTALL/var/cache/dbt" -type d -empty -delete
       # let the runtime user add drivers later if one is missing
       chmod -R a+rwX "$CRAFT_PART_INSTALL/var/cache/dbt"
-    prime:
-      # chisel marks each package's *_copyright slice as essential, so
-      # /usr/share/doc/*/copyright would otherwise be staged
-      - -usr/share/doc
+    # no prime filters: chisel marks each package's *_copyright slice as
+    # essential, and the license texts under /usr/share/doc/*/copyright are
+    # kept on purpose for license compliance/auditability (a few KB)
