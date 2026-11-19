@@ -1,13 +1,13 @@
 name: dbt
 base: bare
 build-base: ubuntu@24.04
-version: "2.0.11" # track latest dbt OSS v2 tag on github.com/dbt-labs/dbt
-summary: dbt OSS v2 (Fusion) as a chiselled Ubuntu rock
+version: "v2.0.11" # track the latest dbt OSS v2 tag on github.com/dbt-labs/dbt
+summary: dbt v2 OSS as a chiselled Ubuntu rock
 description: |
   Minimal, chiselled OCI image containing the dbt OSS v2 Rust binary from the
   dbt-labs/dbt GitHub release, with ADBC database drivers pre-cached at build
-  time (dbt system install-drivers). Pebble entrypoint; designed as a base
-  image for derived project rocks.
+  time (dbt system install-drivers). Designed as a base image for derived
+  project rocks (add your own Pebble/services layer on top).
 license: Apache-2.0
 run-user: _daemon_
 platforms:
@@ -24,6 +24,7 @@ environment:
 parts:
   dbt:
     plugin: nil
+    source: .
     build-packages:
       - ca-certificates # HTTPS to the dbt CDN during install-drivers
       - curl
@@ -36,41 +37,18 @@ parts:
       - libgcc-s1_libs
       - libstdc++6_libs   # needed by the duckdb/postgresql ADBC drivers
       - libpq5_libs       # libpq.so.5, needed by the postgresql ADBC driver
+      - libssl3_libs       # libssl.so.3/libcrypto.so.3, needed by libpq5 for TLS
       - base-passwd_data
       - ca-certificates_data
       - base-files_release-info
       # writes /var/lib/chisel/manifest.yaml: the machine-readable record of
       # exactly which packages/slices were cut into this rock (SBOM/audit)
       - base-files_chisel
+    # Build logic lives in scripts/build.sh (pulled in via `source: .`) and is
+    # parameterised through env vars (DBT_VERSION, DBT_SHA256_AMD64/ARM64,
+    # DBT_ADBC_DRIVERS), so a pipeline can build any dbt release without editing
+    # this file. The script itself is never staged: only $CRAFT_PART_INSTALL is.
     override-build: |
-      # release tarballs are per-arch; checksums from the release's SHA256SUMS
-      case "$CRAFT_ARCH_BUILD_FOR" in
-        amd64) plat="x86_64-unknown-linux-gnu"; sha="bf468f6f43f6d64eb636c2dd9deb7d1eb17f7c57a09d509c0836b44c60688b4c" ;;
-        arm64) plat="aarch64-unknown-linux-gnu"; sha="68192de14b71e490209104ab7b3ee022be35db0b2b9f4870e50dcd142fe52d9f" ;;
-        *) echo "unsupported build arch: $CRAFT_ARCH_BUILD_FOR" >&2; exit 1 ;;
-      esac
-      url="https://github.com/dbt-labs/dbt/releases/download/v2.0.11/dbt-core-2.0.11-${plat}.tar.gz"
-      curl -fsSL "$url" -o "$CRAFT_PART_SRC/dbt.tar.gz"
-      echo "$sha  $CRAFT_PART_SRC/dbt.tar.gz" | sha256sum -c -
-      tar -xzf "$CRAFT_PART_SRC/dbt.tar.gz" -C "$CRAFT_PART_SRC"
-      install -Dm755 "$CRAFT_PART_SRC"/dbt-core-*/dbt "$CRAFT_PART_INSTALL/usr/bin/dbt"
-      # Pre-cache ADBC drivers so the runtime needs no CDN access.
-      # install-drivers only fetches "all"; prune down to the adapters this
-      # rock should ship (one driver per dbt project is the norm). Edit as needed.
-      keep="postgresql duckdb"
-      XDG_CACHE_HOME="$CRAFT_PART_INSTALL/var/cache/dbt" \
-        "$CRAFT_PART_INSTALL/usr/bin/dbt" system install-drivers
-      for so in "$CRAFT_PART_INSTALL/var/cache/dbt/com.getdbt/adbc/"*/*.so; do
-        base=$(basename "$so")
-        keep_it=0
-        for k in $keep; do
-          case "$base" in "libadbc_driver_${k}-"*) keep_it=1 ;; esac
-        done
-        if [ "$keep_it" -eq 0 ]; then rm -f "$so"; fi
-      done
-      find "$CRAFT_PART_INSTALL/var/cache/dbt" -type d -empty -delete
-      # let the runtime user add drivers later if one is missing
-      chmod -R a+rwX "$CRAFT_PART_INSTALL/var/cache/dbt"
-    # no prime filters: chisel marks each package's *_copyright slice as
-    # essential, and the license texts under /usr/share/doc/*/copyright are
-    # kept on purpose for license compliance/auditability (a few KB)
+      bash "$CRAFT_PART_BUILD/scripts/build.sh"
+    # license texts under /usr/share/doc/*/copyright are
+    # kept on purpose for license compliance/auditability (a few KB).
