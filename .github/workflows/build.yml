@@ -71,32 +71,34 @@ jobs:
       - id: r
         run: |
           v=$(sed -n 's/^version:[[:space:]]*"\([^"]*\)".*/\1/p' rockcraft.yaml | head -n 1)
-          echo "version=$v" >> "$GITHUB_OUTPUT"
-          bash scripts/check-upstream.sh --shas "$v"
-          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
-            echo "kind=pr" >> "$GITHUB_OUTPUT"
-            echo "tag_prefix=pr-${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "kind=nightly" >> "$GITHUB_OUTPUT"
-            echo "$GITHUB_TOKEN" | skopeo login ghcr.io -u "${{ github.actor }}" --password-stdin
-            # ubuntu@26.04 -> docker://ubuntu:26.04
-            base=$(sed -n 's/^build-base:[[:space:]]*//p' rockcraft.yaml)
-            base_digest=$(skopeo inspect "docker://${base/@/:}" --format '{{.Digest}}')
-            short=${base_digest#sha256:}; short=${short:0:12}
-            echo "base_digest=$base_digest" >> "$GITHUB_OUTPUT"
-            echo "tag_prefix=nightly-$(date -u +%Y%m%d)-$short" >> "$GITHUB_OUTPUT"
-            # short-circuit: skip if a nightly image built with this exact base
-            # digest already exists (bare-base rocks carry no base-digest OCI
-            # annotation, so the digest is embedded in the tag itself)
-            if skopeo list-tags "docker://${IMAGE}" | jq -e --arg s "-$short-" \
-                '[.Tags[] | select(startswith("nightly-")) | select(contains($s))] | length > 0' >/dev/null; then
-              echo "nightly image for base $base_digest already exists; nothing to do"
-              echo "skip=true" >> "$GITHUB_OUTPUT"
+          bash scripts/check-upstream.sh --shas "$v" # appends sha_amd64/sha_arm64 to $GITHUB_OUTPUT
+          {
+            echo "version=$v"
+            if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+              echo "kind=pr"
+              echo "tag_prefix=pr-${{ github.event.pull_request.number }}"
+              echo "skip=false"
             else
-              echo "skip=false" >> "$GITHUB_OUTPUT"
+              echo "kind=nightly"
+              echo "$GITHUB_TOKEN" | skopeo login ghcr.io -u "${{ github.actor }}" --password-stdin
+              # ubuntu@26.04 -> docker://ubuntu:26.04
+              base=$(sed -n 's/^build-base:[[:space:]]*//p' rockcraft.yaml)
+              base_digest=$(skopeo inspect "docker://${base/@/:}" --format '{{.Digest}}')
+              short=${base_digest#sha256:}; short=${short:0:12}
+              echo "base_digest=$base_digest"
+              echo "tag_prefix=nightly-$(date -u +%Y%m%d)-$short"
+              # short-circuit: skip if a nightly image built with this exact base
+              # digest already exists (bare-base rocks carry no base-digest OCI
+              # annotation, so the digest is embedded in the tag itself)
+              if skopeo list-tags "docker://${IMAGE}" | jq -e --arg s "-$short-" \
+                  '[.Tags[] | select(startswith("nightly-")) | select(contains($s))] | length > 0' >/dev/null; then
+                echo "nightly image for base $base_digest already exists; nothing to do"
+                echo "skip=true"
+              else
+                echo "skip=false"
+              fi
             fi
-          fi
+          } >> "$GITHUB_OUTPUT"
 
   build:
     needs: resolve
@@ -165,7 +167,9 @@ jobs:
       - name: rename rock per variant
         run: mv "out/dbt_${DBT_VERSION}_${{ matrix.arch }}.rock" "out/dbt_${DBT_VERSION}_${{ matrix.variant }}_${{ matrix.arch }}.rock"
       - name: smoke test
-        run: bash scripts/smoke-test.sh "out/dbt_${DBT_VERSION}_${{ matrix.variant }}_${{ matrix.arch }}.rock" "$DBT_VERSION" $DBT_ADBC_DRIVERS
+        run: |
+          read -ra drivers <<<"$DBT_ADBC_DRIVERS"
+          bash scripts/smoke-test.sh "out/dbt_${DBT_VERSION}_${{ matrix.variant }}_${{ matrix.arch }}.rock" "$DBT_VERSION" "${drivers[@]}"
       # no per-job PR comment here — the summarize job posts a single summary
       - uses: actions/upload-artifact@v7
         with:
