@@ -1,6 +1,6 @@
 name: dbt
 base: bare
-build-base: ubuntu@24.04
+build-base: ubuntu@26.04
 version: "v2.0.11" # track the latest dbt OSS v2 tag on github.com/dbt-labs/dbt
 summary: dbt v2 OSS as a chiselled Ubuntu rock
 description: |
