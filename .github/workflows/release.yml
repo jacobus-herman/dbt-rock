@@ -74,9 +74,10 @@ jobs:
             docker manifest annotate "${IMAGE}:${V}-${variant}" "${IMAGE}:pr-${PR_NUMBER}-${variant}-arm64" --os linux --arch arm64
             docker manifest push "${IMAGE}:${V}-${variant}"
             # seed latest-<variant> from the release manifest; the nightly build
-            # re-points it at each new nightly of the version pinned on main
-            docker manifest create "${IMAGE}:latest-${variant}" "${IMAGE}:${V}-${variant}"
-            docker manifest push "${IMAGE}:latest-${variant}"
+            # re-points it at each new nightly of the version pinned on main.
+            # NB: a manifest list cannot reference another manifest list via
+            # `docker manifest create`, so copy the list as-is with skopeo
+            skopeo copy --all "docker://${IMAGE}:${V}-${variant}" "docker://${IMAGE}:latest-${variant}"
             # temporary pr tags are no longer needed once the version manifest exists
             skopeo delete "docker://${IMAGE}:pr-${PR_NUMBER}-${variant}-amd64" || echo "warn: could not delete pr tag (amd64)"
             skopeo delete "docker://${IMAGE}:pr-${PR_NUMBER}-${variant}-arm64" || echo "warn: could not delete pr tag (arm64)"
