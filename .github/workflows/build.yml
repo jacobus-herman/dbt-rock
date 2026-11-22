@@ -102,22 +102,14 @@ jobs:
         # variant list is inlined here (and in push-images below)
         variant: [bigquery, clickhouse, databricks, dbt, duckdb, mssql, postgresql, redshift, salesforce, spark, snowflake]
         arch: [amd64, arm64]
-    # runner OS is irrelevant to the rock content. NB: there is NO
-    # 'ubuntu-latest-arm' label (unlike macOS) — Ubuntu arm64 runners only have
-    # versioned labels; keep this in sync with what ubuntu-latest points to on x64.
-    # The job runs inside Canonical's rockcraft image (rockcraft + umoci
-    # preinstalled, runs as root so no sudo/snap needed); only small extras are
-    # apt-installed below. (No stable-26.04 tag exists yet — use stable-24.04;
-    # the container's Ubuntu version doesn't affect the rock, which is built
-    # from build-base: ubuntu@26.04.)
+    # runner OS is irrelevant to the rock content (rockcraft builds the rootfs
+    # from build-base in its own container). NB: there is NO 'ubuntu-latest-arm'
+    # label (unlike macOS) — Ubuntu arm64 runners only have versioned labels;
+    # keep this in sync with what ubuntu-latest points to on x64.
+    # rockcraft is distributed as a snap (latest/stable) — there is no public
+    # ghcr.io/canonical/rockcraft image — so install it per run; docker and git
+    # are preinstalled on the VM runners.
     runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-26.04-arm' || 'ubuntu-latest' }}
-    container: ghcr.io/canonical/rockcraft:stable-24.04
-    services:
-      docker: # for scripts/smoke-test.sh
-        image: docker:dind
-        options: --privileged
-        ports:
-          - 2375:2375
     env:
       # host env propagates into the rockcraft build; build.sh verifies the
       # tarball against these and requires DBT_VERSION == version: in rockcraft.yaml
@@ -129,19 +121,22 @@ jobs:
       DBT_BASE_DIGEST: ${{ needs.resolve.outputs.base_digest }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       PR_NUMBER: ${{ github.event.pull_request.number }}
-      DOCKER_HOST: tcp://localhost:2375
     steps:
       - uses: actions/checkout@v6
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      - name: install small extras (rockcraft itself is in the job container)
-        run: apt-get update && apt-get install -y git curl ca-certificates skopeo docker-cli
+      - name: install rockcraft (snap) + skopeo
+        run: |
+          # rockcraft has no 1.x snap track; latest/stable is 1.x (1.21.x) and
+          # accepts the yaml's 1.x schema
+          sudo snap install rockcraft --channel=latest/stable --classic
+          sudo apt-get update && sudo apt-get install -y skopeo
       - name: pack rock
-        # the job container runs as root, so --destructive-mode's chown works
-        # without sudo; pass the DBT_* vars explicitly (host env propagates
-        # into the rockcraft build). rockcraft does not create -o dir itself.
+        # --destructive-mode chowns the unpacked rootfs, so it needs root; GitHub
+        # runner sudo ignores -E, so pass the DBT_* vars explicitly via `env`.
+        # rockcraft does not create the -o dir itself.
         run: >-
-          mkdir -p out && env
+          mkdir -p out && sudo env
           DBT_VERSION="$DBT_VERSION"
           DBT_SHA256_AMD64="$DBT_SHA256_AMD64"
           DBT_SHA256_ARM64="$DBT_SHA256_ARM64"

@@ -36,12 +36,12 @@ Variants: one per driver, with `duckdb` shipping both duckdb and duckdb_extended
    The build also self-checks this and fails on mismatch
    (override only with `DBT_ALLOW_VERSION_MISMATCH=1`).
 3. Lint: `shellcheck scripts/build.sh` and `rockcraft expand-extensions`.
-4. Build per variant x arch: the build job runs in `ghcr.io/canonical/rockcraft:stable-26.04`
-   as root (no snap/sudo), with:
-   `env DBT_VERSION=... DBT_SHA256_AMD64=... DBT_SHA256_ARM64=... DBT_ADBC_DRIVERS=<drivers> rockcraft pack --destructive-mode --build-for <arch> -o out/`
-   (`--destructive-mode` chowns the unpacked rootfs — fine as root in the job
-   container; host env propagates into the build, pass the `DBT_*` vars via
-   `env` explicitly.)
+4. Build per variant x arch on the VM runner:
+   `mkdir -p out && sudo env DBT_VERSION=... DBT_SHA256_AMD64=... DBT_SHA256_ARM64=... DBT_ADBC_DRIVERS=<drivers> rockcraft pack --destructive-mode --build-for <arch> -o out/`
+   (`--destructive-mode` chowns the unpacked rootfs, so it needs root; GitHub
+   runner sudo ignores `-E`, so pass the `DBT_*` vars via `env` explicitly;
+   rockcraft does not create the `-o` dir itself. Host env propagates into the
+   build.)
 5. Smoke test:
    `scripts/smoke-test.sh out/dbt_${DBT_VERSION}_<variant>_<arch>.rock "$DBT_VERSION" <drivers...>`
 6. Push each `.rock` with skopeo to `ghcr.io/<owner>/dbt:pr-<n>-<variant>-<arch>`
@@ -52,14 +52,13 @@ Variants: one per driver, with `duckdb` shipping both duckdb and duckdb_extended
 
 ## Runner requirements
 
-- build jobs run inside Canonical's rockcraft image
-  (`container: ghcr.io/canonical/rockcraft:stable-24.04` — no stable-26.04 tag
-  exists yet; root, no snap/sudo);
-  only `git curl skopeo docker-cli` are apt-installed on top. Smoke tests get a
-  docker daemon from a `docker:dind` job service (`DOCKER_HOST=tcp://localhost:2375`).
-  If a rockcraft image tag is missing, fall back to the snap:
-  `snap install rockcraft --channel=latest/stable --classic` (no `1.x` track
-  exists; latest/stable is 1.x and accepts the yaml's 1.x schema)
+- rockcraft is distributed as a snap only — there is no public
+  `ghcr.io/canonical/rockcraft` container image (those tags 404) — so build jobs
+  install it per run: `snap install rockcraft --channel=latest/stable --classic`
+  (no `1.x` track exists; latest/stable is 1.x and accepts the yaml's 1.x
+  schema). `docker` and `git` are preinstalled on the VM runners; only `skopeo`
+  is apt-installed. The runner OS does not affect the rock (rockcraft builds the
+  rootfs from `build-base` in its own container).
 - `yq`, `shellcheck` for linting
 - network access to `github.com`, `ghcr.io` and `public.cdn.getdbt.com` (driver
   downloads at build time)
