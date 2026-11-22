@@ -37,7 +37,6 @@ permissions:
 
 env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/dbt
-  VARIANTS: '["bigquery","clickhouse","databricks","dbt","duckdb","mssql","postgresql","redshift","salesforce","spark","snowflake"]'
 
 jobs:
   resolve:
@@ -95,7 +94,9 @@ jobs:
       fail-fast: false
       max-parallel: 6
       matrix:
-        variant: ${{ fromJSON(env.VARIANTS) }}
+        # NB: the `env` context is not allowed in strategy.matrix, so the
+        # variant list is inlined here (and in push-images below)
+        variant: [bigquery, clickhouse, databricks, dbt, duckdb, mssql, postgresql, redshift, salesforce, spark, snowflake]
         arch: [amd64, arm64]
     # runner OS is irrelevant to the rock content (rockcraft builds in its own
     # container); track ubuntu-latest on both arches via the -arm alias
@@ -141,7 +142,7 @@ jobs:
       fail-fast: false
       max-parallel: 6
       matrix:
-        variant: ${{ fromJSON(env.VARIANTS) }}
+        variant: [bigquery, clickhouse, databricks, dbt, duckdb, mssql, postgresql, redshift, salesforce, spark, snowflake]
         arch: [amd64, arm64]
     runs-on: ubuntu-latest
     env:
