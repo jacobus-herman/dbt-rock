@@ -92,7 +92,11 @@ jobs:
     if: needs.resolve.outputs.skip != 'true'
     strategy:
       fail-fast: false
-      max-parallel: 6
+      # let all variant x arch jobs queue at once: amd64 runners are plentiful
+      # and start immediately, while arm64 (ubuntu-latest-arm) jobs may wait for
+      # the smaller shared arm runner pool — a low max-parallel would let waiting
+      # arm jobs block amd64 jobs
+      max-parallel: 22
       matrix:
         # NB: the `env` context is not allowed in strategy.matrix, so the
         # variant list is inlined here (and in push-images below)
@@ -123,7 +127,9 @@ jobs:
           sudo snap install rockcraft --channel=latest/stable --classic
           sudo apt-get update && sudo apt-get install -y skopeo
       - name: pack rock
-        run: rockcraft pack --destructive-mode --build-for ${{ matrix.arch }} -o out/
+        # --destructive-mode unpacks/chowns the rootfs, so it needs root;
+        # -E keeps the DBT_* env vars that must propagate into the build
+        run: sudo -E rockcraft pack --destructive-mode --build-for ${{ matrix.arch }} -o out/
       - name: rename rock per variant
         run: mv "out/dbt_${DBT_VERSION}_${{ matrix.arch }}.rock" "out/dbt_${DBT_VERSION}_${{ matrix.variant }}_${{ matrix.arch }}.rock"
       - name: smoke test
