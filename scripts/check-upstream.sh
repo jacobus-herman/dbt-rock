@@ -14,6 +14,20 @@ set -euo pipefail
 
 upstream="dbt-labs/dbt"
 
+# Resolve just the tarball checksums for a given release tag (used by
+# build.yml on pull requests, where there is no check job to inherit them from):
+#   check-upstream.sh --shas v2.0.11   →  sha_amd64=... / sha_arm64=...
+if [ "${1:-}" = "--shas" ]; then
+  t="${2:?usage: check-upstream.sh --shas <release-tag>}"
+  v="${t#v}"
+  sums=$(curl -fsSL "https://github.com/${upstream}/releases/download/${t}/SHA256SUMS")
+  awk -v a="dbt-core-${v}-x86_64-unknown-linux-gnu.tar.gz" \
+      -v b="dbt-core-${v}-aarch64-unknown-linux-gnu.tar.gz" \
+      '$2 == a {print "sha_amd64=" $1} $2 == b {print "sha_arm64=" $1}' <<<"$sums" \
+    >> "${GITHUB_OUTPUT:-/dev/stdout}"
+  exit 0
+fi
+
 current=$(sed -n 's/^version:[[:space:]]*"\([^"]*\)".*/\1/p' rockcraft.yaml | head -n 1)
 current_ver="${current#v}"
 

@@ -36,16 +36,18 @@ See `CI_CD.md` for the full pipeline.
 
 ## Image variants
 
-The pipeline builds one image per ADBC driver variant, per arch, tagged
-`ghcr.io/<owner>/dbt:<version>-<variant>-<arch>` and published as multi-arch
-manifests `<version>-<variant>`: `bigquery`, `clickhouse`, `databricks`, `dbt`,
+The pipeline (see `CI_CD.md`) builds one image per ADBC driver variant, per
+arch, published as multi-arch manifests `ghcr.io/<owner>/dbt:<version>-<variant>`:
+`bigquery`, `clickhouse`, `databricks`, `dbt`,
 `duckdb` (ships both `duckdb` and `duckdb_extended`), `mssql`, `postgresql`,
 `redshift`, `salesforce`, `spark`, `snowflake`. There is deliberately no bare
 `<version>`, `latest`, or combined `default` tag — every image names exactly
 one driver variant.
 
     docker pull ghcr.io/<owner>/dbt:v2.0.11-duckdb       # duckdb + duckdb_extended
-    docker pull ghcr.io/<owner>/dbt:v2.0.11-postgresql   # postgresql only Accepted risk: the image sets
+    docker pull ghcr.io/<owner>/dbt:v2.0.11-postgresql   # postgresql only
+
+Accepted risk: the image sets
 `DBT_ALLOW_EXPERIMENTAL_ADAPTERS=true` because the postgresql adapter is
 experimental in dbt OSS v2.
 

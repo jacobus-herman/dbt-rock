@@ -1,0 +1,117 @@
+# PR build (implements the build half of CI_CD.md).
+#
+# Runs on every PR to the default branch (opened/synchronize/reopened):
+# resolves the dbt version from rockcraft.yaml + the tarball SHA256s from the
+# release's SHA256SUMS, then for every ADBC driver variant x arch packs a rock
+# (rockcraft 1.x), smoke tests it, comments the result on the PR, and pushes
+# the rock as ghcr.io/<owner>/dbt:pr-<n>-<variant>-<arch>.
+#
+# Images are deliberately NOT tagged with the dbt version here — release.yml
+# promotes the pr-<n> images to <version>-<variant> manifests when the PR
+# merges. Fork PRs build + smoke test but skip the image push (read-only token).
+#
+# Variants: one image per ADBC driver ("duckdb" ships both duckdb and
+# duckdb_extended). If dbt adds a driver, add it to VARIANTS below.
+name: build
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [main] # keep in sync with the repo's default branch
+
+concurrency:
+  group: build-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/dbt
+  VARIANTS: '["bigquery","clickhouse","databricks","dbt","duckdb","mssql","postgresql","redshift","salesforce","spark","snowflake"]'
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.r.outputs.version }}
+      sha_amd64: ${{ steps.r.outputs.sha_amd64 }}
+      sha_arm64: ${{ steps.r.outputs.sha_arm64 }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - id: r
+        run: |
+          v=$(sed -n 's/^version:[[:space:]]*"\([^"]*\)".*/\1/p' rockcraft.yaml | head -n 1)
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          bash scripts/check-upstream.sh --shas "$v"
+
+  build:
+    needs: resolve
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        variant: ${{ fromJSON(env.VARIANTS) }}
+        arch: [amd64, arm64]
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    env:
+      # host env propagates into the rockcraft build; build.sh verifies the
+      # tarball against these and requires DBT_VERSION == version: in rockcraft.yaml
+      DBT_VERSION: ${{ needs.resolve.outputs.version }}
+      DBT_SHA256_AMD64: ${{ needs.resolve.outputs.sha_amd64 }}
+      DBT_SHA256_ARM64: ${{ needs.resolve.outputs.sha_arm64 }}
+      DBT_ADBC_DRIVERS: ${{ matrix.variant }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - name: install rockcraft 1.x + skopeo
+        run: |
+          sudo snap install rockcraft --channel=1.x/stable --classic
+          sudo apt-get update && sudo apt-get install -y skopeo
+      - name: pack rock
+        run: rockcraft pack --destructive-mode --build-for ${{ matrix.arch }} -o out/
+      - name: rename rock per variant
+        run: mv "out/dbt_${DBT_VERSION}_${{ matrix.arch }}.rock" "out/dbt_${DBT_VERSION}_${{ matrix.variant }}_${{ matrix.arch }}.rock"
+      - name: smoke test
+        run: bash scripts/smoke-test.sh "out/dbt_${DBT_VERSION}_${{ matrix.variant }}_${{ matrix.arch }}.rock" "$DBT_VERSION" $DBT_ADBC_DRIVERS
+      - name: comment on PR
+        run: |
+          gh pr comment "$PR_NUMBER" --body "Built + smoke-tested variant \`${{ matrix.variant }}\` (${{ matrix.arch }}) for dbt ${DBT_VERSION}: dbt --version OK, ADBC drivers cached, cache ownership OK."
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rock-${{ matrix.variant }}-${{ matrix.arch }}
+          path: out/dbt_${DBT_VERSION}_${{ matrix.variant }}_${{ matrix.arch }}.rock
+
+  push-images:
+    needs: [resolve, build]
+    if: needs.build.result == 'success' && github.event.pull_request.head.repo.full_name == github.repository
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        variant: ${{ fromJSON(env.VARIANTS) }}
+        arch: [amd64, arm64]
+    runs-on: ubuntu-latest
+    env:
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      DBT_VERSION: ${{ needs.resolve.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: rock-${{ matrix.variant }}-${{ matrix.arch }}
+          path: rocks
+      - name: push pr-tagged image (no version tag yet; release.yml promotes on merge)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GITHUB_TOKEN" | skopeo login ghcr.io -u "${{ github.actor }}" --password-stdin
+          skopeo copy "docker-archive:rocks/dbt_${DBT_VERSION}_${{ matrix.variant }}_${{ matrix.arch }}.rock" \
+            "docker://${IMAGE}:pr-${PR_NUMBER}-${{ matrix.variant }}-${{ matrix.arch }}"
+          echo "pushed ${IMAGE}:pr-${PR_NUMBER}-${{ matrix.variant }}-${{ matrix.arch }}"

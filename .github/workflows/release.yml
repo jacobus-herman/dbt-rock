@@ -1,16 +1,21 @@
-# Publish a merged release: runs on push to the default branch (main) and, if
-# the `version:` tag does not exist yet, promotes the per-variant per-arch
-# images that upstream-release.yml pushed from the release PR into multi-arch
-# manifests ghcr.io/<owner>/dbt:<version>-<variant> (no bare <version> or
-# :latest tag — every image names its driver variant explicitly). Then creates
-# the git tag and GitHub release.
-# The .rock files are not attached to the GitHub release (24 rocks would exceed
+# Release publish (implements the release half of CI_CD.md).
+#
+# Runs when a PR to the default branch is merged. It reads the dbt version from
+# rockcraft.yaml, promotes the pr-<n>-<variant>-<arch> images that build.yml
+# pushed into multi-arch manifests ghcr.io/<owner>/dbt:<version>-<variant>
+# (no bare <version> or :latest tag — every image names its driver variant),
+# deletes the temporary pr-<n> tags, and creates the git tag + GitHub release.
+# The .rock files are not attached to the GitHub release (22 rocks would exceed
 # asset limits) — pull them from ghcr instead.
 name: release
 
 on:
-  push:
+  pull_request:
+    types: [closed]
     branches: [main] # keep in sync with the repo's default branch
+
+concurrency:
+  group: release-pr-${{ github.event.pull_request.number }}
 
 permissions:
   contents: write
@@ -21,7 +26,10 @@ env:
 
 jobs:
   release:
+    if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
+    env:
+      PR_NUMBER: ${{ github.event.pull_request.number }}
     steps:
       - uses: actions/checkout@v4
       - name: resolve version from rockcraft.yaml
@@ -41,7 +49,7 @@ jobs:
       - name: install skopeo
         if: steps.skip.outputs.skip != 'true'
         run: sudo apt-get update && sudo apt-get install -y skopeo
-      - name: publish multi-arch manifests per variant
+      - name: promote pr images to version-tagged multi-arch manifests
         if: steps.skip.outputs.skip != 'true'
         env:
           V: ${{ steps.ver.outputs.version }}
@@ -49,17 +57,24 @@ jobs:
         run: |
           echo "$GITHUB_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
           echo "$GITHUB_TOKEN" | skopeo login ghcr.io -u "${{ github.actor }}" --password-stdin
-          # discover variants from the per-arch tags pushed by upstream-release.yml
+          # discover variants from the pr-tagged per-arch images pushed by build.yml
           variants=$(skopeo list-tags "docker://${IMAGE}" \
-            | jq -r --arg v "${V}" '.Tags[] | select(startswith($v + "-")) | select(endswith("-amd64"))
-                      | sub("^" + $v + "-"; "") | sub("-amd64$"; "")' | sort -u)
+            | jq -r --arg p "pr-${PR_NUMBER}-" '.Tags[] | select(startswith($p)) | select(endswith("-amd64"))
+                      | sub("^" + $p; "") | sub("-amd64$"; "")' | sort -u)
+          if [ -z "$variants" ]; then
+            echo "no pr-${PR_NUMBER}-* images found in ${IMAGE} — did the build workflow run?" >&2
+            exit 1
+          fi
           echo "variants: $variants"
           for variant in $variants; do
             docker manifest create "${IMAGE}:${V}-${variant}" \
-              "${IMAGE}:${V}-${variant}-amd64" "${IMAGE}:${V}-${variant}-arm64"
-            docker manifest annotate "${IMAGE}:${V}-${variant}" "${IMAGE}:${V}-${variant}-amd64" --os linux --arch amd64
-            docker manifest annotate "${IMAGE}:${V}-${variant}" "${IMAGE}:${V}-${variant}-arm64" --os linux --arch arm64
+              "${IMAGE}:pr-${PR_NUMBER}-${variant}-amd64" "${IMAGE}:pr-${PR_NUMBER}-${variant}-arm64"
+            docker manifest annotate "${IMAGE}:${V}-${variant}" "${IMAGE}:pr-${PR_NUMBER}-${variant}-amd64" --os linux --arch amd64
+            docker manifest annotate "${IMAGE}:${V}-${variant}" "${IMAGE}:pr-${PR_NUMBER}-${variant}-arm64" --os linux --arch arm64
             docker manifest push "${IMAGE}:${V}-${variant}"
+            # temporary pr tags are no longer needed once the version manifest exists
+            skopeo delete "docker://${IMAGE}:pr-${PR_NUMBER}-${variant}-amd64" || echo "warn: could not delete pr tag (amd64)"
+            skopeo delete "docker://${IMAGE}:pr-${PR_NUMBER}-${variant}-arm64" || echo "warn: could not delete pr tag (arm64)"
           done
       - name: git tag + GitHub release
         if: steps.skip.outputs.skip != 'true'
