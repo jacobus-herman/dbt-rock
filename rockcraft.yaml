@@ -1,0 +1,55 @@
+name: dbt
+base: bare
+build-base: ubuntu@26.04
+version: "v2.0.11" # track the latest dbt OSS v2 tag on github.com/dbt-labs/dbt
+summary: dbt v2 OSS as a chiselled Ubuntu rock
+description: |
+  Minimal, chiselled OCI image containing the dbt OSS v2 Rust binary from the
+  dbt-labs/dbt GitHub release, with ADBC database drivers pre-cached at build
+  time (dbt system install-drivers). Designed as a base image for derived
+  project rocks (add your own Pebble/services layer on top).
+license: Apache-2.0
+run-user: _daemon_
+platforms:
+  amd64:
+  arm64:
+
+environment:
+  # dbt v2 caches ADBC drivers under $XDG_CACHE_HOME/com.getdbt/adbc
+  XDG_CACHE_HOME: /var/cache/dbt
+  # postgres is an experimental adapter in dbt OSS v2; without this the
+  # cached postgresql driver is rejected before it is ever loaded
+  DBT_ALLOW_EXPERIMENTAL_ADAPTERS: "true"
+
+parts:
+  dbt:
+    plugin: nil
+    source: .
+    build-packages:
+      - ca-certificates # HTTPS to the dbt CDN during install-drivers
+      - curl
+    stage-packages:
+      # Chisel slices for the runtime: the dbt binary is a dynamically linked
+      # manylinux_2_28 ELF (needs ld-linux/libc/libm/libdl/libpthread from
+      # libc6_libs, libgcc_s from libgcc-s1_libs); TLS is statically linked
+      # (rustls), so only the CA bundle is needed for driver downloads.
+      - libc6_libs
+      - libgcc-s1_libs
+      - libstdc++6_libs   # needed by the duckdb/postgresql ADBC drivers
+      - libpq5_libs       # libpq.so.5, needed by the postgresql ADBC driver
+      - libssl3t64_libs    # libssl.so.3/libcrypto.so.3, needed by libpq5 for TLS
+                           # (t64-renamed package name in 24.04 and 26.04)
+      - base-passwd_data
+      - ca-certificates_data
+      - base-files_release-info
+      # writes /var/lib/chisel/manifest.yaml: the machine-readable record of
+      # exactly which packages/slices were cut into this rock (SBOM/audit)
+      - base-files_chisel
+    # Build logic lives in scripts/build.sh (pulled in via `source: .`) and is
+    # parameterised through env vars (DBT_VERSION, DBT_SHA256_AMD64/ARM64,
+    # DBT_ADBC_DRIVERS), so a pipeline can build any dbt release without editing
+    # this file. The script itself is never staged: only $CRAFT_PART_INSTALL is.
+    override-build: |
+      bash "$CRAFT_PART_BUILD/scripts/build.sh"
+    # license texts under /usr/share/doc/*/copyright are
+    # kept on purpose for license compliance/auditability (a few KB).

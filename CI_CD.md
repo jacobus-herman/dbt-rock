@@ -1,0 +1,106 @@
+# CI/CD implementation notes
+
+Implemented as three workflows:
+
+- `.github/workflows/upstream-release.yml` — daily schedule + manual dispatch
+  (active once on the default branch). `scripts/check-upstream.sh` resolves
+  the newest stable dbt release and its SHA256SUMs; if newer than `version:`,
+  it opens a PR from `release/dbt-<version>` with `version:` bumped.
+- `.github/workflows/build.yml` — on every PR to main: resolves version +
+  SHA256s (`check-upstream.sh --shas`), builds one rock per ADBC driver
+  variant x arch, smoke tests, and pushes `pr-<n>-<variant>-<arch>` images
+  (no version tag yet). Also runs nightly (schedule, default branch): rebuilds
+  the version pinned on main as `nightly-<yyyymmdd>-<variant>` manifests so the
+  floating Ubuntu base slices pick up security fixes; the dbt binary and ADBC
+  drivers stay pinned by checksum.
+- `.github/workflows/release.yml` — on PR merge: promotes the `pr-<n>` images
+  to multi-arch `<version>-<variant>` manifests, seeds `latest-<variant>` from
+  them, deletes the pr tags, creates the git tag and GitHub release.
+- `latest-<variant>` (e.g. `latest-duckdb`) always points at the newest nightly
+  of the latest dbt version: seeded from the release manifest at merge time,
+  then re-pointed by every nightly build.
+
+Pipeline shape: scheduled check for a new release tag in `dbt-labs/dbt` →
+release PR → per-variant per-arch build on the PR (images tagged
+`pr-<n>-<variant>-<arch>`) → on merge, promote to multi-arch
+`<version>-<variant>` manifests (no bare `<version>`, `latest`, or combined
+default tag — every image names exactly one driver variant).
+Variants: one per driver, with `duckdb` shipping both duckdb and duckdb_extended.
+
+## Steps (per dbt release tag, e.g. `v2.0.11`)
+
+1. Resolve inputs — never hand-copy hashes:
+   `DBT_VERSION=<tag>`; fetch
+   `https://github.com/dbt-labs/dbt/releases/download/$DBT_VERSION/SHA256SUMS`
+   and parse out `DBT_SHA256_AMD64` / `DBT_SHA256_ARM64`.
+2. Align the image label with the release (rockcraft 1.x cannot interpolate
+   env vars in `rockcraft.yaml`):
+   `yq -i '.version = env(DBT_VERSION)' rockcraft.yaml`
+   The build also self-checks this and fails on mismatch
+   (override only with `DBT_ALLOW_VERSION_MISMATCH=1`).
+3. Lint: `shellcheck scripts/build.sh` and `rockcraft expand-extensions`.
+4. Build per variant x arch on the VM runner:
+   `mkdir -p out && sudo env DBT_VERSION=... DBT_SHA256_AMD64=... DBT_SHA256_ARM64=... DBT_ADBC_DRIVERS=<drivers> rockcraft pack --destructive-mode --build-for <arch> -o out/`
+   (`--destructive-mode` chowns the unpacked rootfs, so it needs root; GitHub
+   runner sudo ignores `-E`, so pass the `DBT_*` vars via `env` explicitly;
+   rockcraft does not create the `-o` dir itself. Host env propagates into the
+   build.)
+5. Smoke test:
+   `scripts/smoke-test.sh out/dbt_${DBT_VERSION}_<variant>_<arch>.rock "$DBT_VERSION" <drivers...>`
+6. Push each `.rock` with skopeo (`oci-archive:` transport — .rock files are OCI
+   archives, not docker-archives) to `ghcr.io/<owner>/dbt:pr-<n>-<variant>-<arch>`
+   (build.yml); release.yml on merge re-tags them into the multi-arch
+   `<version>-<variant>` manifests. Registry credentials are the default
+   GITHUB_TOKEN; there are no other secrets — releases are public and
+   checksum-gated.
+
+## Runner requirements
+
+- rockcraft is distributed as a snap only — there is no public
+  `ghcr.io/canonical/rockcraft` container image (those tags 404) — so build jobs
+  install it per run: `snap install rockcraft --channel=latest/stable --classic`
+  (no `1.x` track exists; latest/stable is 1.x and accepts the yaml's 1.x
+  schema). `docker` and `git` are preinstalled on the VM runners; only `skopeo`
+  is apt-installed. The runner OS does not affect the rock (rockcraft builds the
+  rootfs from `build-base` in its own container).
+- `yq`, `shellcheck` for linting
+- network access to `github.com`, `ghcr.io` and `public.cdn.getdbt.com` (driver
+  downloads at build time)
+- runners: `ubuntu-latest` (amd64) and `ubuntu-26.04-arm` (arm64); the runner
+  OS does not affect the rock content (rockcraft builds in its own container).
+  Note: there is **no `ubuntu-latest-arm` label** (that alias exists only for
+  macOS) — Ubuntu arm64 runners only have versioned labels (`ubuntu-26.04-arm`,
+  `ubuntu-24.04-arm`, ...), so keep the arm label in sync with what
+  `ubuntu-latest` points to. GitHub has no queue timeout for hosted runners —
+  `timeout-minutes` only covers execution — so a `runs-on` label that matches
+  no runner leaves the job queued forever; cancel the run manually in that case.
+  Arm runners are also a smaller shared pool, so arm jobs may legitimately wait
+  at "Waiting for a runner to pick up this job" while amd64 jobs start
+  immediately (build.yml uses max-parallel: 22 so waiting arm jobs don't block
+  amd64 ones).
+
+## Guardrails already enforced in the build
+
+- every image carries a `com.getdbt.adbc-driver` OCI manifest annotation naming
+  the bundled ADBC driver variant (set post-pack via the umoci bundled in the
+  rockcraft snap, since rockcraft 1.x has no custom annotations key)
+
+- tarball sha256 verified against the release's SHA256SUMS (build fails on mismatch)
+- `DBT_VERSION` must match `version:` in rockcraft.yaml
+- provenance (dbt version, tarball URL+sha256, sha256 of each cached driver
+  `.so`) is written to `/var/lib/dbt/provenance` inside the image — the chisel
+  manifest only covers the Ubuntu slices
+- driver cache is writable only by the runtime user (`_daemon_`, uid/gid 584792
+  — the fixed mapping rockcraft applies to `run-user` in every rock), not
+  world-writable; the smoke test asserts the owner matches the image user
+- image runs as `_daemon_`, `base: bare`, chiselled slices only, license texts kept
+
+## Accepted risks
+
+- `DBT_ALLOW_EXPERIMENTAL_ADAPTERS=true` ships the experimental postgresql
+  adapter (required for the cached driver to load).
+- `build-base: ubuntu@26.04` floats with Ubuntu updates — good for security
+  patches, less bit-reproducible. The nightly build short-circuits when the
+  base digest is unchanged: the digest is embedded in the nightly tag
+  (`nightly-<yyyymmdd>-<digest12>-<variant>`) and recorded in the image's
+  /var/lib/dbt/provenance (bare-base rocks carry no base-digest OCI annotation).

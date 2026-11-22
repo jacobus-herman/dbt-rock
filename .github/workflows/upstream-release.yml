@@ -1,0 +1,91 @@
+# Upstream discovery (implements the first half of CI_CD.md).
+#
+# Daily (and on demand) checks whether dbt-labs/dbt has a newer stable release
+# than the `version:` pinned in rockcraft.yaml. If so it opens a PR to the
+# default branch from release/dbt-<version> with `version:` bumped to that tag.
+# The build.yml workflow builds + smoke tests + pushes per-variant images on
+# that PR (tagged pr-<n>-...), and release.yml publishes the version-tagged
+# manifests once the PR is merged.
+#
+# Note: schedule/workflow_dispatch only fire once this file is on the default
+# branch. Only the default GITHUB_TOKEN is used (contents/pull-requests write)
+# — releases are public and checksum-gated.
+name: upstream-release
+
+on:
+  schedule:
+    - cron: "0 6 * * *" # daily check for a new dbt OSS release
+  workflow_dispatch:
+
+concurrency:
+  group: upstream-release
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  BASE: ${{ github.event.repository.default_branch }}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      upgrade: ${{ steps.up.outputs.upgrade }}
+      dbt_version: ${{ steps.up.outputs.dbt_version }}
+      sha_amd64: ${{ steps.up.outputs.sha_amd64 }}
+      sha_arm64: ${{ steps.up.outputs.sha_arm64 }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: up
+        run: bash scripts/check-upstream.sh
+      - run: echo "upgrade=${{ steps.up.outputs.upgrade }} target=${{ steps.up.outputs.dbt_version }}"
+
+  pr:
+    needs: check
+    if: needs.check.outputs.upgrade == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      branch: ${{ steps.pr.outputs.branch }}
+      number: ${{ steps.pr.outputs.number }}
+    env:
+      DBT_VERSION: ${{ needs.check.outputs.dbt_version }}
+      SHA_AMD64: ${{ needs.check.outputs.sha_amd64 }}
+      SHA_ARM64: ${{ needs.check.outputs.sha_arm64 }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.BASE }}
+      - name: Set version in rockcraft.yaml
+        run: >-
+          sed -i -E "s/^(version:[[:space:]]*\")[^\"]*(\")/\1${DBT_VERSION}\2/" rockcraft.yaml
+      - id: pr
+        run: |
+          branch="release/dbt-${DBT_VERSION}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add rockcraft.yaml
+          git commit -m "Bump dbt to ${DBT_VERSION}"
+          # force-with-lease: on re-runs the remote branch exists with an
+          # identical-content commit (different sha), so a plain push is rejected
+          git push -u origin "$branch" --force-with-lease
+          # idempotent on re-runs: reuse the PR if this branch already has one
+          number=$(gh pr list --head "$branch" --base "${BASE}" --json number --jq '.[0].number // empty')
+          if [ -z "$number" ]; then
+            number=$(gh pr create --base "${BASE}" --head "$branch" \
+              --title "Release dbt ${DBT_VERSION}" \
+              --body "Automated bump of dbt OSS to ${DBT_VERSION}. The build workflow will pack one rock per ADBC driver variant x arch and push them as \`pr-<n>-<variant>-<arch>\` images; merging publishes the \`${DBT_VERSION}-<variant>\` manifests.
+
+              Tarball SHA256s taken from the release's SHA256SUMS:
+              - amd64: ${SHA_AMD64}
+              - arm64: ${SHA_ARM64}
+
+              The build verifies the download against these and records them in
+              /var/lib/dbt/provenance." \
+              --json number --jq '.number')
+          fi
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "number=$number" >> "$GITHUB_OUTPUT"

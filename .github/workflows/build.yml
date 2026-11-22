@@ -1,0 +1,296 @@
+# Build (implements the build half of CI_CD.md).
+#
+# Two triggers:
+# - pull_request to the default branch (opened/synchronize/reopened): build
+#   every ADBC driver variant x arch on the PR head, smoke test, comment on
+#   the PR, and push the rocks as ghcr.io/<owner>/dbt:pr-<n>-<variant>-<arch>.
+#   Images are deliberately NOT tagged with the dbt version here — release.yml
+#   promotes the pr-<n> images to <version>-<variant> manifests on merge.
+# - schedule (nightly, default branch only): rebuild the version pinned in
+#   rockcraft.yaml so the floating Ubuntu base slices pick up security fixes.
+#   The dbt binary and ADBC drivers are immutable pinned artifacts; only the
+#   base changes. Pushed as nightly-<yyyymmdd>-<variant> manifests.
+#
+# Fork PRs build + smoke test but skip the image push (read-only token).
+#
+# Variants: one image per ADBC driver ("duckdb" ships both duckdb and
+# duckdb_extended). If dbt adds a driver, add it to scripts/variants.txt.
+# To nightly-rebuild additional pinned dbt versions, add them as a matrix over
+# DBT_VERSION with DBT_ALLOW_VERSION_MISMATCH=1 (rockcraft.yaml keeps one version).
+# NB: this name is the aggregate check run shown on PRs — require THIS in the
+# branch protection rule, not the individual matrix jobs.
+name: build rocks
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [main] # keep in sync with the repo's default branch
+  schedule:
+    - cron: "0 3 * * *" # nightly rebuild of the pinned version (base-image security updates)
+
+concurrency:
+  group: build-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  packages: write
+  actions: write # required for upload-artifact/download-artifact; any declared
+                  # permissions block sets all undeclared ones to "none"
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/dbt
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: sudo apt-get update && sudo apt-get install -y shellcheck jq
+      - run: bash -n scripts/*.sh && shellcheck scripts/*.sh
+      # install actionlint pinned to a release (never curl|bash a moving branch);
+      # validates workflow syntax incl. expression contexts
+      - run: curl -fsSLo actionlint.tgz https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz && tar xzf actionlint.tgz actionlint
+      - run: ./actionlint .github/workflows/*.yml
+
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.r.outputs.version }}
+      sha_amd64: ${{ steps.r.outputs.sha_amd64 }}
+      sha_arm64: ${{ steps.r.outputs.sha_arm64 }}
+      kind: ${{ steps.r.outputs.kind }}
+      tag_prefix: ${{ steps.r.outputs.tag_prefix }}
+      skip: ${{ steps.r.outputs.skip }}
+      base_digest: ${{ steps.r.outputs.base_digest }}
+      variants: ${{ steps.r.outputs.variants }}
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: install skopeo
+        run: sudo apt-get update && sudo apt-get install -y skopeo
+      - id: r
+        run: |
+          v=$(sed -n 's/^version:[[:space:]]*"\([^"]*\)".*/\1/p' rockcraft.yaml | head -n 1)
+          bash scripts/check-upstream.sh --shas "$v" # appends sha_amd64/sha_arm64 to $GITHUB_OUTPUT
+          {
+            echo "version=$v"
+            # -c: GITHUB_OUTPUT values must be single-line, so compact JSON
+            echo "variants=$(jq -cRn '[inputs | select(. != "")]' scripts/variants.txt)"
+            if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+              echo "kind=pr"
+              echo "tag_prefix=pr-${{ github.event.pull_request.number }}"
+              echo "skip=false"
+            else
+              echo "kind=nightly"
+              echo "$GITHUB_TOKEN" | skopeo login ghcr.io -u "${{ github.actor }}" --password-stdin
+              # ubuntu@26.04 -> docker://ubuntu:26.04
+              base=$(sed -n 's/^build-base:[[:space:]]*//p' rockcraft.yaml)
+              base_digest=$(skopeo inspect "docker://${base/@/:}" --format '{{.Digest}}')
+              short=${base_digest#sha256:}; short=${short:0:12}
+              echo "base_digest=$base_digest"
+              echo "tag_prefix=nightly-$(date -u +%Y%m%d)-$short"
+              # short-circuit: skip if a nightly image built with this exact base
+              # digest already exists (bare-base rocks carry no base-digest OCI
+              # annotation, so the digest is embedded in the tag itself)
+              if skopeo list-tags "docker://${IMAGE}" | jq -e --arg s "-$short-" \
+                  '[.Tags[] | select(startswith("nightly-")) | select(contains($s))] | length > 0' >/dev/null; then
+                echo "nightly image for base $base_digest already exists; nothing to do"
+                echo "skip=true"
+              else
+                echo "skip=false"
+              fi
+            fi
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.skip != 'true'
+    strategy:
+      fail-fast: false
+      # let all variant x arch jobs queue at once: amd64 runners are plentiful
+      # and start immediately, while arm64 (ubuntu-26.04-arm) jobs may wait for
+      # the smaller shared arm runner pool — a low max-parallel would let waiting
+      # arm jobs block amd64 jobs
+      max-parallel: 22
+      matrix:
+        variant: ${{ fromJSON(needs.resolve.outputs.variants) }}
+        arch: [amd64, arm64]
+    # runner OS is irrelevant to the rock content (rockcraft builds the rootfs
+    # from build-base in its own container). NB: there is NO 'ubuntu-latest-arm'
+    # label (unlike macOS) — Ubuntu arm64 runners only have versioned labels;
+    # keep this in sync with what ubuntu-latest points to on x64.
+    # rockcraft is distributed as a snap (latest/stable) — there is no public
+    # ghcr.io/canonical/rockcraft image — so install it per run; docker and git
+    # are preinstalled on the VM runners.
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-26.04-arm' || 'ubuntu-latest' }}
+    env:
+      # host env propagates into the rockcraft build; build.sh verifies the
+      # tarball against these and requires DBT_VERSION == version: in rockcraft.yaml
+      DBT_VERSION: ${{ needs.resolve.outputs.version }}
+      DBT_SHA256_AMD64: ${{ needs.resolve.outputs.sha_amd64 }}
+      DBT_SHA256_ARM64: ${{ needs.resolve.outputs.sha_arm64 }}
+      DBT_ADBC_DRIVERS: ${{ matrix.variant }}
+      # recorded in the image provenance on nightly builds
+      DBT_BASE_DIGEST: ${{ needs.resolve.outputs.base_digest }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: install rockcraft (snap) + skopeo
+        run: |
+          # rockcraft has no 1.x snap track; latest/stable is 1.x (1.21.x) and
+          # accepts the yaml's 1.x schema
+          sudo snap install rockcraft --channel=latest/stable --classic
+          sudo apt-get update && sudo apt-get install -y skopeo
+      - name: pack rock + annotate the ADBC driver variant
+        # --destructive-mode chowns the unpacked rootfs, so it needs root; GitHub
+        # runner sudo ignores -E, so pass the DBT_* vars via `env` explicitly.
+        # rockcraft does not create the -o dir itself. rockcraft 1.x has no custom
+        # annotations key, so the variant annotation is added post-pack with the
+        # umoci bundled in the rockcraft snap: .rock archive -> OCI layout ->
+        # annotate -> back to archive (rockcraft's internal images/ layout is not
+        # reliable after export).
+        run: |
+          set -e
+          mkdir -p out
+          sudo env DBT_VERSION="$DBT_VERSION" DBT_SHA256_AMD64="$DBT_SHA256_AMD64" \
+            DBT_SHA256_ARM64="$DBT_SHA256_ARM64" DBT_ADBC_DRIVERS="$DBT_ADBC_DRIVERS" \
+            DBT_BASE_DIGEST="${DBT_BASE_DIGEST:-}" \
+            rockcraft pack --destructive-mode --build-for ${{ matrix.arch }} -o out/
+          rock="out/dbt_${DBT_VERSION}_${{ matrix.arch }}.rock"
+          sudo skopeo copy "oci-archive:${rock}:${DBT_VERSION}" "oci:.rocklayout:${DBT_VERSION}"
+          # NB: umoci's --image is a plain path:tag, no "oci:" prefix
+          sudo /snap/rockcraft/current/bin/umoci config --image ".rocklayout:${DBT_VERSION}" \
+            --manifest.annotation "com.getdbt.adbc-driver=${DBT_ADBC_DRIVERS}"
+          sudo skopeo copy "oci:.rocklayout:${DBT_VERSION}" "oci-archive:${rock}:${DBT_VERSION}"
+          sudo rm -rf .rocklayout
+      - name: rename rock per variant
+        run: mv "out/dbt_${DBT_VERSION}_${{ matrix.arch }}.rock" "out/dbt_${DBT_VERSION}_${{ matrix.variant }}_${{ matrix.arch }}.rock"
+      - name: smoke test
+        run: |
+          read -ra drivers <<<"$DBT_ADBC_DRIVERS"
+          bash scripts/smoke-test.sh "out/dbt_${DBT_VERSION}_${{ matrix.variant }}_${{ matrix.arch }}.rock" "$DBT_VERSION" "${drivers[@]}"
+      # no per-job PR comment here — the summarize job posts a single summary
+      # upload-artifact maxes at v7; download-artifact v8 (push-images) reads
+      # any v4+ upload, so v7 upload + v8 download are compatible.
+      # NB: `with:` does NOT expand $VARS — only ${{ }} expressions — and
+      # if-no-files-found: error makes a missing rock fail this job instead of
+      # warning and letting push-images fail later with "artifact not found"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: rock-${{ matrix.variant }}-${{ matrix.arch }}
+          path: out/dbt_${{ env.DBT_VERSION }}_${{ matrix.variant }}_${{ matrix.arch }}.rock
+          if-no-files-found: error
+
+  push-images:
+    needs: [resolve, build]
+    # fork PRs get a read-only token: build + smoke test only, no image push
+    if: needs.resolve.outputs.skip != 'true' && needs.build.result == 'success' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        variant: ${{ fromJSON(needs.resolve.outputs.variants) }}
+        arch: [amd64, arm64]
+    runs-on: ubuntu-latest
+    env:
+      DBT_VERSION: ${{ needs.resolve.outputs.version }}
+      TAG_PREFIX: ${{ needs.resolve.outputs.tag_prefix }}
+      KIND: ${{ needs.resolve.outputs.kind }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: rock-${{ matrix.variant }}-${{ matrix.arch }}
+          path: rocks
+      - name: push per-arch image
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GITHUB_TOKEN" | skopeo login ghcr.io -u "${{ github.actor }}" --password-stdin
+          # PR builds: pr-<n>-... (no version tag; release.yml promotes on merge).
+          # Nightly builds: nightly-<yyyymmdd>-... (fresh base slices, version stays pinned).
+          # .rock files are OCI archives, hence the oci-archive: transport
+          skopeo copy "oci-archive:rocks/dbt_${DBT_VERSION}_${{ matrix.variant }}_${{ matrix.arch }}.rock" \
+            "docker://${IMAGE}:${TAG_PREFIX}-${{ matrix.variant }}-${{ matrix.arch }}"
+          echo "pushed ${IMAGE}:${TAG_PREFIX}-${{ matrix.variant }}-${{ matrix.arch }}"
+
+  # Nightly only: publish the multi-arch manifests after ALL arch cells of
+  # push-images finished (running this per-cell raced on the same tag and could
+  # reference a not-yet-pushed sibling arch). latest-<variant> points at the
+  # newest nightly of the version pinned on main (release.yml seeds it from the
+  # release manifest at merge time).
+  publish-manifests:
+    needs: [resolve, push-images]
+    if: needs.resolve.outputs.kind == 'nightly' && needs.push-images.result == 'success'
+    runs-on: ubuntu-latest
+    env:
+      TAG_PREFIX: ${{ needs.resolve.outputs.tag_prefix }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: install skopeo, login
+        run: |
+          sudo apt-get update && sudo apt-get install -y skopeo
+          echo "$GITHUB_TOKEN" | skopeo login ghcr.io -u "${{ github.actor }}" --password-stdin
+          echo "$GITHUB_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: publish nightly + latest manifests per variant
+        run: |
+          variants=$(skopeo list-tags "docker://${IMAGE}" \
+            | jq -r --arg p "${TAG_PREFIX}-" '.Tags[] | select(startswith($p)) | select(endswith("-amd64"))
+                      | sub("^" + $p; "") | sub("-amd64$"; "")' | sort -u)
+          if [ -z "$variants" ]; then
+            echo "no ${TAG_PREFIX}-* images found — did push-images run?" >&2
+            exit 1
+          fi
+          for variant in $variants; do
+            for tag in "${TAG_PREFIX}-${variant}" "latest-${variant}"; do
+              docker manifest create "${IMAGE}:${tag}" \
+                "${IMAGE}:${TAG_PREFIX}-${variant}-amd64" "${IMAGE}:${TAG_PREFIX}-${variant}-arm64"
+              docker manifest annotate "${IMAGE}:${tag}" "${IMAGE}:${TAG_PREFIX}-${variant}-amd64" --os linux --arch amd64
+              docker manifest annotate "${IMAGE}:${tag}" "${IMAGE}:${TAG_PREFIX}-${variant}-arm64" --os linux --arch arm64
+              docker manifest push "${IMAGE}:${tag}"
+            done
+          done
+
+  # One summary comment per PR run (updated in place on re-runs), instead of
+  # one comment per matrix job.
+  summarize:
+    needs: [resolve, build, push-images]
+    # fork PRs get a read-only token and cannot be commented on
+    if: always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      DBT_VERSION: ${{ needs.resolve.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6 # gh pr comment needs a git repo to resolve the PR
+      - name: post single summary comment on the PR
+        run: |
+          jobs=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs?per_page=100" \
+            --jq '[.jobs[] | select(.name | startswith("build (") or startswith("push-images (")) | {name, conclusion}]')
+          total=$(jq length <<<"$jobs")
+          ok=$(jq '[.[] | select(.conclusion == "success")] | length' <<<"$jobs")
+          failed=$(jq -r '[.[] | select(.conclusion != "success") | .name] | join(", ")' <<<"$jobs")
+          if [ "$total" = 0 ]; then
+            status="no build/push jobs ran"
+          elif [ "$ok" = "$total" ]; then
+            status="✅ all ${total} build + smoke test + image push jobs passed"
+          else
+            status="⚠️ ${ok}/${total} build/push jobs passed; failed: ${failed:-—}"
+          fi
+          variants=$(paste -sd', ' scripts/variants.txt)
+          body="dbt ${DBT_VERSION} rock build summary: ${status}
+
+          Variants: ${variants} × amd64/arm64.
+          Images (when all passed): \`ghcr.io/${{ github.repository_owner }}/dbt:pr-${PR_NUMBER}-<variant>-<arch>\`"
+          # keep exactly one bot comment: delete previous ones, then post fresh
+          for id in $(gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments?per_page=100" \
+            --jq '[.[] | select(.user.login == "github-actions[bot]")] | .[].id'); do
+            gh api --method DELETE "repos/${{ github.repository }}/issues/comments/${id}" >/dev/null
+          done
+          gh pr comment "$PR_NUMBER" --body "$body"
