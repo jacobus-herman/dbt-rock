@@ -36,11 +36,12 @@ Variants: one per driver, with `duckdb` shipping both duckdb and duckdb_extended
    The build also self-checks this and fails on mismatch
    (override only with `DBT_ALLOW_VERSION_MISMATCH=1`).
 3. Lint: `shellcheck scripts/build.sh` and `rockcraft expand-extensions`.
-4. Build per variant x arch on matching runners:
-   `sudo env DBT_VERSION=... DBT_SHA256_AMD64=... DBT_SHA256_ARM64=... DBT_ADBC_DRIVERS=<drivers> rockcraft pack --destructive-mode --build-for <arch> -o out/`
-   (`--destructive-mode` chowns the unpacked rootfs, so it must run as root;
-   GitHub runner sudo ignores `-E`, so pass the `DBT_*` vars via `env`
-   explicitly. Host env propagates into the build.)
+4. Build per variant x arch: the build job runs in `ghcr.io/canonical/rockcraft:stable-26.04`
+   as root (no snap/sudo), with:
+   `env DBT_VERSION=... DBT_SHA256_AMD64=... DBT_SHA256_ARM64=... DBT_ADBC_DRIVERS=<drivers> rockcraft pack --destructive-mode --build-for <arch> -o out/`
+   (`--destructive-mode` chowns the unpacked rootfs — fine as root in the job
+   container; host env propagates into the build, pass the `DBT_*` vars via
+   `env` explicitly.)
 5. Smoke test:
    `scripts/smoke-test.sh out/dbt_${DBT_VERSION}_<variant>_<arch>.rock "$DBT_VERSION" <drivers...>`
 6. Push each `.rock` with skopeo to `ghcr.io/<owner>/dbt:pr-<n>-<variant>-<arch>`
@@ -51,12 +52,16 @@ Variants: one per driver, with `duckdb` shipping both duckdb and duckdb_extended
 
 ## Runner requirements
 
-- rockcraft from `latest/stable` — the snap has no `1.x` track; the yaml uses
-  the 1.x schema, which latest/stable still accepts
-  (`snap install rockcraft --channel=latest/stable --classic`)
-- `yq`, `shellcheck`, `skopeo`, `docker`
-- network access to `github.com` and `public.cdn.getdbt.com` (driver downloads
-  at build time)
+- build jobs run inside Canonical's rockcraft image
+  (`container: ghcr.io/canonical/rockcraft:stable-26.04`, root, no snap/sudo);
+  only `git curl skopeo docker-cli` are apt-installed on top. Smoke tests get a
+  docker daemon from a `docker:dind` job service (`DOCKER_HOST=tcp://localhost:2375`).
+  If a rockcraft image tag is missing, fall back to the snap:
+  `snap install rockcraft --channel=latest/stable --classic` (no `1.x` track
+  exists; latest/stable is 1.x and accepts the yaml's 1.x schema)
+- `yq`, `shellcheck` for linting
+- network access to `github.com`, `ghcr.io` and `public.cdn.getdbt.com` (driver
+  downloads at build time)
 - runners: `ubuntu-latest` (amd64) and `ubuntu-26.04-arm` (arm64); the runner
   OS does not affect the rock content (rockcraft builds in its own container).
   Note: there is **no `ubuntu-latest-arm` label** (that alias exists only for

@@ -102,11 +102,20 @@ jobs:
         # variant list is inlined here (and in push-images below)
         variant: [bigquery, clickhouse, databricks, dbt, duckdb, mssql, postgresql, redshift, salesforce, spark, snowflake]
         arch: [amd64, arm64]
-    # runner OS is irrelevant to the rock content (rockcraft builds in its own
-    # container). NB: there is NO 'ubuntu-latest-arm' label (unlike macOS) —
-    # Ubuntu arm64 runners only have versioned labels; keep this in sync with
-    # what ubuntu-latest points to on x64
+    # runner OS is irrelevant to the rock content. NB: there is NO
+    # 'ubuntu-latest-arm' label (unlike macOS) — Ubuntu arm64 runners only have
+    # versioned labels; keep this in sync with what ubuntu-latest points to on x64.
+    # The job runs inside Canonical's rockcraft image (rockcraft + umoci
+    # preinstalled, runs as root so no sudo/snap needed); only small extras are
+    # apt-installed below. If the stable-26.04 tag ever disappears, use stable-24.04.
     runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-26.04-arm' || 'ubuntu-latest' }}
+    container: ghcr.io/canonical/rockcraft:stable-26.04
+    services:
+      docker: # for scripts/smoke-test.sh
+        image: docker:dind
+        options: --privileged
+        ports:
+          - 2375:2375
     env:
       # host env propagates into the rockcraft build; build.sh verifies the
       # tarball against these and requires DBT_VERSION == version: in rockcraft.yaml
@@ -118,22 +127,19 @@ jobs:
       DBT_BASE_DIGEST: ${{ needs.resolve.outputs.base_digest }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       PR_NUMBER: ${{ github.event.pull_request.number }}
+      DOCKER_HOST: tcp://localhost:2375
     steps:
       - uses: actions/checkout@v6
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      - name: install rockcraft + skopeo
-        run: |
-          # rockcraft is only published on latest/stable (there is no 1.x track);
-          # rockcraft.yaml uses the 1.x schema, which latest/stable still accepts
-          sudo snap install rockcraft --channel=latest/stable --classic
-          sudo apt-get update && sudo apt-get install -y skopeo
+      - name: install small extras (rockcraft itself is in the job container)
+        run: apt-get update && apt-get install -y git curl ca-certificates skopeo docker-cli
       - name: pack rock
-        # --destructive-mode unpacks/chowns the rootfs, so it needs root. GitHub
-        # runner sudo ignores -E, so pass the DBT_* vars explicitly via `env`;
-        # host env propagates into the rockcraft build.
+        # the job container runs as root, so --destructive-mode's chown works
+        # without sudo; pass the DBT_* vars explicitly (host env propagates
+        # into the rockcraft build). rockcraft does not create -o dir itself.
         run: >-
-          sudo env
+          mkdir -p out && env
           DBT_VERSION="$DBT_VERSION"
           DBT_SHA256_AMD64="$DBT_SHA256_AMD64"
           DBT_SHA256_ARM64="$DBT_SHA256_ARM64"
