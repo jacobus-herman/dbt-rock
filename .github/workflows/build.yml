@@ -129,24 +129,29 @@ jobs:
           # accepts the yaml's 1.x schema
           sudo snap install rockcraft --channel=latest/stable --classic
           sudo apt-get update && sudo apt-get install -y skopeo
-      - name: pack rock
+      - name: pack rock + annotate the ADBC driver variant
         # --destructive-mode chowns the unpacked rootfs, so it needs root; GitHub
-        # runner sudo ignores -E, so pass the DBT_* vars explicitly via `env`.
-        # rockcraft does not create the -o dir itself.
-        run: >-
-          mkdir -p out && sudo env
-          DBT_VERSION="$DBT_VERSION"
-          DBT_SHA256_AMD64="$DBT_SHA256_AMD64"
-          DBT_SHA256_ARM64="$DBT_SHA256_ARM64"
-          DBT_ADBC_DRIVERS="$DBT_ADBC_DRIVERS"
-          DBT_BASE_DIGEST="${DBT_BASE_DIGEST:-}"
-          rockcraft pack --destructive-mode --build-for ${{ matrix.arch }} -o out/
+        # runner sudo ignores -E, so pass the DBT_* vars via `env` explicitly.
+        # rockcraft does not create the -o dir itself. rockcraft 1.x has no custom
+        # annotations key, so the variant annotation is added post-pack with the
+        # umoci bundled in the rockcraft snap, then the archive is re-exported.
+        run: |
+          set -e
+          mkdir -p out
+          sudo env DBT_VERSION="$DBT_VERSION" DBT_SHA256_AMD64="$DBT_SHA256_AMD64" \
+            DBT_SHA256_ARM64="$DBT_SHA256_ARM64" DBT_ADBC_DRIVERS="$DBT_ADBC_DRIVERS" \
+            DBT_BASE_DIGEST="${DBT_BASE_DIGEST:-}" \
+            rockcraft pack --destructive-mode --build-for ${{ matrix.arch }} -o out/
+          sudo /snap/rockcraft/current/bin/umoci config --image "oci:images/dbt:${DBT_VERSION}" \
+            --manifest.annotation "com.getdbt.adbc-driver=${DBT_ADBC_DRIVERS}"
+          sudo skopeo copy "oci:images/dbt:${DBT_VERSION}" \
+            "oci-archive:out/dbt_${DBT_VERSION}_${{ matrix.arch }}.rock:${DBT_VERSION}"
       - name: rename rock per variant
         run: mv "out/dbt_${DBT_VERSION}_${{ matrix.arch }}.rock" "out/dbt_${DBT_VERSION}_${{ matrix.variant }}_${{ matrix.arch }}.rock"
       - name: smoke test
         run: bash scripts/smoke-test.sh "out/dbt_${DBT_VERSION}_${{ matrix.variant }}_${{ matrix.arch }}.rock" "$DBT_VERSION" $DBT_ADBC_DRIVERS
       # no per-job PR comment here — the summarize job posts a single summary
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: rock-${{ matrix.variant }}-${{ matrix.arch }}
           path: out/dbt_${DBT_VERSION}_${{ matrix.variant }}_${{ matrix.arch }}.rock
@@ -167,7 +172,7 @@ jobs:
       TAG_PREFIX: ${{ needs.resolve.outputs.tag_prefix }}
       KIND: ${{ needs.resolve.outputs.kind }}
     steps:
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           name: rock-${{ matrix.variant }}-${{ matrix.arch }}
           path: rocks
@@ -216,16 +221,16 @@ jobs:
       - name: post single summary comment on the PR
         run: |
           jobs=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs?per_page=100" \
-            --jq '[.jobs[] | select(.name | startswith("build (")) | {name, conclusion}]')
+            --jq '[.jobs[] | select(.name | startswith("build (") or startswith("push-images (")) | {name, conclusion}]')
           total=$(jq length <<<"$jobs")
           ok=$(jq '[.[] | select(.conclusion == "success")] | length' <<<"$jobs")
           failed=$(jq -r '[.[] | select(.conclusion != "success") | .name] | join(", ")' <<<"$jobs")
           if [ "$total" = 0 ]; then
-            status="no build jobs ran"
+            status="no build/push jobs ran"
           elif [ "$ok" = "$total" ]; then
-            status="✅ all ${total} variant×arch builds + smoke tests passed"
+            status="✅ all ${total} build + smoke test + image push jobs passed"
           else
-            status="⚠️ ${ok}/${total} passed; failed: ${failed:-—}"
+            status="⚠️ ${ok}/${total} build/push jobs passed; failed: ${failed:-—}"
           fi
           body="dbt ${DBT_VERSION} rock build summary: ${status}
 

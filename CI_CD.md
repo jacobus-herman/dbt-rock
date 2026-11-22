@@ -81,6 +81,10 @@ Variants: one per driver, with `duckdb` shipping both duckdb and duckdb_extended
 
 ## Guardrails already enforced in the build
 
+- every image carries a `com.getdbt.adbc-driver` OCI manifest annotation naming
+  the bundled ADBC driver variant (set post-pack via the umoci bundled in the
+  rockcraft snap, since rockcraft 1.x has no custom annotations key)
+
 - tarball sha256 verified against the release's SHA256SUMS (build fails on mismatch)
 - `DBT_VERSION` must match `version:` in rockcraft.yaml
 - provenance (dbt version, tarball URL+sha256, sha256 of each cached driver
