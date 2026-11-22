@@ -45,9 +45,10 @@ jobs:
       - uses: actions/checkout@v6
       - run: sudo apt-get update && sudo apt-get install -y shellcheck jq
       - run: bash -n scripts/*.sh && shellcheck scripts/*.sh
-      - uses: rhysd/actionlint-action@v1
-        with:
-          args: .github/workflows/*.yml
+      # install actionlint directly (the rhysd/actionlint-action wrapper is not
+      # resolvable); validates workflow syntax incl. expression contexts
+      - run: curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash | bash
+      - run: ./actionlint .github/workflows/*.yml
 
   resolve:
     runs-on: ubuntu-latest
