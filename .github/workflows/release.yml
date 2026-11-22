@@ -5,7 +5,10 @@
 # pushed into multi-arch manifests ghcr.io/<owner>/dbt:<version>-<variant>
 # (no bare <version> or :latest tag), seeds ghcr.io/<owner>/dbt:latest-<variant>
 # from them (the nightly build re-points latest-<variant> at each new nightly),
-# deletes the temporary pr-<n> tags, and creates the git tag + GitHub release.
+# deletes the temporary pr-<n> tags via the Packages API (GHCR has no registry
+# DELETE endpoint; the package is repo-linked and workflow-published, so the
+# default GITHUB_TOKEN with packages: write can delete its versions), and
+# creates the git tag + GitHub release.
 # The .rock files are not attached to the GitHub release (22 rocks would exceed
 # asset limits) — pull them from ghcr instead.
 name: release
@@ -51,6 +54,7 @@ jobs:
         if: steps.skip.outputs.skip != 'true'
         run: sudo apt-get update && sudo apt-get install -y skopeo
       - name: promote pr images to version-tagged multi-arch manifests
+        id: promote
         if: steps.skip.outputs.skip != 'true'
         env:
           V: ${{ steps.ver.outputs.version }}
@@ -78,18 +82,39 @@ jobs:
             # NB: a manifest list cannot reference another manifest list via
             # `docker manifest create`, so copy the list as-is with skopeo
             skopeo copy --all "docker://${IMAGE}:${V}-${variant}" "docker://${IMAGE}:latest-${variant}"
-            # temporary pr tags are no longer needed once the version manifest exists
-            skopeo delete "docker://${IMAGE}:pr-${PR_NUMBER}-${variant}-amd64" || echo "warn: could not delete pr tag (amd64)"
-            skopeo delete "docker://${IMAGE}:pr-${PR_NUMBER}-${variant}-arm64" || echo "warn: could not delete pr tag (arm64)"
           done
+      # GHCR does not support the registry DELETE endpoint (skopeo delete fails
+      # with "unsupported"), so pr-* tags are removed via the Packages API.
+      # The dbt package is repository-linked and published by build.yml, so the
+      # repository has admin on it and the default GITHUB_TOKEN (packages: write)
+      # is allowed to delete versions. Deletes all pr-* tags of closed/merged
+      # PRs (stale orphans included); tags of still-open PRs are kept.
+      - name: delete pr-* image tags via Packages API
+        if: steps.skip.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: bash scripts/cleanup-tags.sh "${IMAGE##*/}" pr
       - name: git tag + GitHub release
         if: steps.skip.outputs.skip != 'true'
         env:
           V: ${{ steps.ver.outputs.version }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          variants=$(paste -sd', ' scripts/variants.txt)
+          img="ghcr.io/${{ github.repository_owner }}/dbt"
+          {
+            echo "## dbt OSS ${V} as chiselled rocks"
+            echo
+            echo "One multi-arch (linux/amd64 + linux/arm64) image per ADBC driver variant:"
+            echo
+            while read -r variant; do
+              [ -n "$variant" ] || continue
+              echo "- \`${img}:${V}-${variant}\`"
+            done < scripts/variants.txt
+            echo
+            echo "- \`duckdb\` ships both the \`duckdb\` and \`duckdb_extended\` drivers"
+            echo "- \`${img}:latest-<variant>\` tracks the newest nightly build of the latest dbt version"
+            echo "- Tarball and driver SHA256 checksums: \`/var/lib/dbt/provenance\` inside each image"
+          } > /tmp/release-notes.md
           git tag "$V" && git push origin "$V"
-          gh release create "$V" \
-            --title "dbt-rock ${V}" \
-            --notes "dbt OSS ${V} as chiselled rocks, one image per ADBC driver variant: \`ghcr.io/${{ github.repository_owner }}/dbt:${V}-<variant>\` (variants: ${variants}; \`duckdb\` ships both duckdb and duckdb_extended). \`latest-<variant>\` tracks the newest nightly of the latest version. Tarball and driver checksums: /var/lib/dbt/provenance in each image."
+          gh release create "$V" --title "dbt-rock ${V}" --notes-file /tmp/release-notes.md

@@ -256,6 +256,23 @@ jobs:
             done
           done
 
+  # GHCR has no native retention UI, so prune here: delete pr-* tags of
+  # closed/merged PRs (stale orphans included; open PRs are kept) and keep
+  # only the newest 60 nightly-* versions. The dbt package is repo-linked and
+  # workflow-published, so the default GITHUB_TOKEN (packages: write) can
+  # delete versions via the Packages API.
+  cleanup-tags:
+    needs: [resolve, publish-manifests]
+    if: needs.resolve.outputs.kind == 'nightly'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: prune pr-* tags and old nightly-* versions
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: bash scripts/cleanup-tags.sh "${IMAGE##*/}" nightly 60
+
   # One summary comment per PR run (updated in place on re-runs), instead of
   # one comment per matrix job.
   summarize:
@@ -283,7 +300,8 @@ jobs:
           else
             status="⚠️ ${ok}/${total} build/push jobs passed; failed: ${failed:-—}"
           fi
-          variants=$(paste -sd', ' scripts/variants.txt)
+          # NB: paste -d cycles through the delimiter CHARACTERS, so -sd', ' alternates , and space
+          variants=$(paste -sd, scripts/variants.txt | sed 's/,/, /g')
           body="dbt ${DBT_VERSION} rock build summary: ${status}
 
           Variants: ${variants} × amd64/arm64.
