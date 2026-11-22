@@ -119,8 +119,6 @@ jobs:
       DBT_ADBC_DRIVERS: ${{ matrix.variant }}
       # recorded in the image provenance on nightly builds
       DBT_BASE_DIGEST: ${{ needs.resolve.outputs.base_digest }}
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      PR_NUMBER: ${{ github.event.pull_request.number }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -147,9 +145,7 @@ jobs:
         run: mv "out/dbt_${DBT_VERSION}_${{ matrix.arch }}.rock" "out/dbt_${DBT_VERSION}_${{ matrix.variant }}_${{ matrix.arch }}.rock"
       - name: smoke test
         run: bash scripts/smoke-test.sh "out/dbt_${DBT_VERSION}_${{ matrix.variant }}_${{ matrix.arch }}.rock" "$DBT_VERSION" $DBT_ADBC_DRIVERS
-      - name: comment on PR
-        run: |
-          gh pr comment "$PR_NUMBER" --body "Built + smoke-tested variant \`${{ matrix.variant }}\` (${{ matrix.arch }}) for dbt ${DBT_VERSION}: dbt --version OK, ADBC drivers cached, cache ownership OK."
+      # no per-job PR comment here — the summarize job posts a single summary
       - uses: actions/upload-artifact@v6
         with:
           name: rock-${{ matrix.variant }}-${{ matrix.arch }}
@@ -204,3 +200,40 @@ jobs:
           docker manifest annotate "${IMAGE}:latest-${{ matrix.variant }}" "${IMAGE}:${TAG_PREFIX}-${{ matrix.variant }}-amd64" --os linux --arch amd64
           docker manifest annotate "${IMAGE}:latest-${{ matrix.variant }}" "${IMAGE}:${TAG_PREFIX}-${{ matrix.variant }}-arm64" --os linux --arch arm64
           docker manifest push "${IMAGE}:latest-${{ matrix.variant }}"
+
+  # One summary comment per PR run (updated in place on re-runs), instead of
+  # one comment per matrix job.
+  summarize:
+    needs: [resolve, build, push-images]
+    if: always() && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      DBT_VERSION: ${{ needs.resolve.outputs.version }}
+    steps:
+      - name: post single summary comment on the PR
+        run: |
+          jobs=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs?per_page=100" \
+            --jq '[.jobs[] | select(.name | startswith("build (")) | {name, conclusion}]')
+          total=$(jq length <<<"$jobs")
+          ok=$(jq '[.[] | select(.conclusion == "success")] | length' <<<"$jobs")
+          failed=$(jq -r '[.[] | select(.conclusion != "success") | .name] | join(", ")' <<<"$jobs")
+          if [ "$total" = 0 ]; then
+            status="no build jobs ran"
+          elif [ "$ok" = "$total" ]; then
+            status="✅ all ${total} variant×arch builds + smoke tests passed"
+          else
+            status="⚠️ ${ok}/${total} passed; failed: ${failed:-—}"
+          fi
+          body="dbt ${DBT_VERSION} rock build summary: ${status}
+
+          Variants: bigquery, clickhouse, databricks, dbt, duckdb, mssql, postgresql, redshift, salesforce, spark, snowflake × amd64/arm64.
+          Images (when all passed): \`ghcr.io/${{ github.repository_owner }}/dbt:pr-${PR_NUMBER}-<variant>-<arch>\`"
+          existing=$(gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments?per_page=100" \
+            --jq '[.[] | select(.user.login == "github-actions[bot]")] | last | .id // empty')
+          if [ -n "$existing" ]; then
+            gh api --method PATCH "repos/${{ github.repository }}/issues/comments/${existing}" -f body="$body" >/dev/null
+          else
+            gh pr comment "$PR_NUMBER" --body "$body"
+          fi
