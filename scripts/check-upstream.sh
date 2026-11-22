@@ -21,10 +21,17 @@ if [ "${1:-}" = "--shas" ]; then
   t="${2:?usage: check-upstream.sh --shas <release-tag>}"
   v="${t#v}"
   sums=$(curl -fsSL "https://github.com/${upstream}/releases/download/${t}/SHA256SUMS")
-  awk -v a="dbt-core-${v}-x86_64-unknown-linux-gnu.tar.gz" \
-      -v b="dbt-core-${v}-aarch64-unknown-linux-gnu.tar.gz" \
-      '$2 == a {print "sha_amd64=" $1} $2 == b {print "sha_arm64=" $1}' <<<"$sums" \
-    >> "${GITHUB_OUTPUT:-/dev/stdout}"
+  out="${GITHUB_OUTPUT:-/dev/stdout}"
+  sha_amd64=$(awk -v a="dbt-core-${v}-x86_64-unknown-linux-gnu.tar.gz" '$2 == a {print $1}' <<<"$sums")
+  sha_arm64=$(awk -v b="dbt-core-${v}-aarch64-unknown-linux-gnu.tar.gz" '$2 == b {print $1}' <<<"$sums")
+  if [ -z "$sha_amd64" ] || [ -z "$sha_arm64" ]; then
+    echo "tarball checksums not found in ${upstream} ${t} SHA256SUMS" >&2
+    exit 1
+  fi
+  {
+    echo "sha_amd64=$sha_amd64"
+    echo "sha_arm64=$sha_arm64"
+  } >> "$out"
   exit 0
 fi
 
@@ -45,10 +52,12 @@ for t in "${tags[@]}"; do
     cands+=("$v")
   fi
 done
-latest=""
-if [ "${#cands[@]}" -gt 0 ]; then
-  latest=$(printf '%s\n' "${cands[@]}" | sort -V | tail -n 1)
+if [ "${#cands[@]}" -eq 0 ]; then
+  # fail loudly instead of silently reporting upgrade=false on an API hiccup
+  echo "no stable vX.Y.Z release tags found in ${upstream} (API or parsing failure?)" >&2
+  exit 1
 fi
+latest=$(printf '%s\n' "${cands[@]}" | sort -V | tail -n 1)
 
 # sort -V decides: upgrade only if latest is strictly greater than current
 # (lexicographic compare would wrongly rank 2.0.9 > 2.0.11).

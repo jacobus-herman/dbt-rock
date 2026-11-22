@@ -14,7 +14,7 @@
 # Fork PRs build + smoke test but skip the image push (read-only token).
 #
 # Variants: one image per ADBC driver ("duckdb" ships both duckdb and
-# duckdb_extended). If dbt adds a driver, add it to VARIANTS below.
+# duckdb_extended). If dbt adds a driver, add it to scripts/variants.txt.
 # To nightly-rebuild additional pinned dbt versions, add them as a matrix over
 # DBT_VERSION with DBT_ALLOW_VERSION_MISMATCH=1 (rockcraft.yaml keeps one version).
 name: build
@@ -34,6 +34,8 @@ permissions:
   contents: read
   pull-requests: write
   packages: write
+  actions: write # required for upload-artifact/download-artifact; any declared
+                  # permissions block sets all undeclared ones to "none"
 
 env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/dbt
@@ -45,9 +47,9 @@ jobs:
       - uses: actions/checkout@v6
       - run: sudo apt-get update && sudo apt-get install -y shellcheck jq
       - run: bash -n scripts/*.sh && shellcheck scripts/*.sh
-      # install actionlint directly (the rhysd/actionlint-action wrapper is not
-      # resolvable); validates workflow syntax incl. expression contexts
-      - run: curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash | bash
+      # install actionlint pinned to a release (never curl|bash a moving branch);
+      # validates workflow syntax incl. expression contexts
+      - run: curl -fsSLo actionlint.tgz https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz && tar xzf actionlint.tgz actionlint
       - run: ./actionlint .github/workflows/*.yml
 
   resolve:
@@ -60,6 +62,7 @@ jobs:
       tag_prefix: ${{ steps.r.outputs.tag_prefix }}
       skip: ${{ steps.r.outputs.skip }}
       base_digest: ${{ steps.r.outputs.base_digest }}
+      variants: ${{ steps.r.outputs.variants }}
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
@@ -74,6 +77,7 @@ jobs:
           bash scripts/check-upstream.sh --shas "$v" # appends sha_amd64/sha_arm64 to $GITHUB_OUTPUT
           {
             echo "version=$v"
+            echo "variants=$(jq -Rn '[inputs | select(. != "")]' scripts/variants.txt)"
             if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
               echo "kind=pr"
               echo "tag_prefix=pr-${{ github.event.pull_request.number }}"
@@ -111,9 +115,7 @@ jobs:
       # arm jobs block amd64 jobs
       max-parallel: 22
       matrix:
-        # NB: the `env` context is not allowed in strategy.matrix, so the
-        # variant list is inlined here (and in push-images below)
-        variant: [bigquery, clickhouse, databricks, dbt, duckdb, mssql, postgresql, redshift, salesforce, spark, snowflake]
+        variant: ${{ fromJSON(needs.resolve.outputs.variants) }}
         arch: [amd64, arm64]
     # runner OS is irrelevant to the rock content (rockcraft builds the rootfs
     # from build-base in its own container). NB: there is NO 'ubuntu-latest-arm'
@@ -184,7 +186,7 @@ jobs:
       fail-fast: false
       max-parallel: 6
       matrix:
-        variant: [bigquery, clickhouse, databricks, dbt, duckdb, mssql, postgresql, redshift, salesforce, spark, snowflake]
+        variant: ${{ fromJSON(needs.resolve.outputs.variants) }}
         arch: [amd64, arm64]
     runs-on: ubuntu-latest
     env:
@@ -207,30 +209,50 @@ jobs:
           skopeo copy "oci-archive:rocks/dbt_${DBT_VERSION}_${{ matrix.variant }}_${{ matrix.arch }}.rock" \
             "docker://${IMAGE}:${TAG_PREFIX}-${{ matrix.variant }}-${{ matrix.arch }}"
           echo "pushed ${IMAGE}:${TAG_PREFIX}-${{ matrix.variant }}-${{ matrix.arch }}"
-      - name: publish nightly multi-arch manifest + update latest-<variant>
-        if: needs.resolve.outputs.kind == 'nightly'
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Nightly only: publish the multi-arch manifests after ALL arch cells of
+  # push-images finished (running this per-cell raced on the same tag and could
+  # reference a not-yet-pushed sibling arch). latest-<variant> points at the
+  # newest nightly of the version pinned on main (release.yml seeds it from the
+  # release manifest at merge time).
+  publish-manifests:
+    needs: [resolve, push-images]
+    if: needs.resolve.outputs.kind == 'nightly' && needs.push-images.result == 'success'
+    runs-on: ubuntu-latest
+    env:
+      TAG_PREFIX: ${{ needs.resolve.outputs.tag_prefix }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: install skopeo, login
         run: |
+          sudo apt-get update && sudo apt-get install -y skopeo
+          echo "$GITHUB_TOKEN" | skopeo login ghcr.io -u "${{ github.actor }}" --password-stdin
           echo "$GITHUB_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-          docker manifest create "${IMAGE}:${TAG_PREFIX}-${{ matrix.variant }}" \
-            "${IMAGE}:${TAG_PREFIX}-${{ matrix.variant }}-amd64" "${IMAGE}:${TAG_PREFIX}-${{ matrix.variant }}-arm64"
-          docker manifest annotate "${IMAGE}:${TAG_PREFIX}-${{ matrix.variant }}" "${IMAGE}:${TAG_PREFIX}-${{ matrix.variant }}-amd64" --os linux --arch amd64
-          docker manifest annotate "${IMAGE}:${TAG_PREFIX}-${{ matrix.variant }}" "${IMAGE}:${TAG_PREFIX}-${{ matrix.variant }}-arm64" --os linux --arch arm64
-          docker manifest push "${IMAGE}:${TAG_PREFIX}-${{ matrix.variant }}"
-          # latest-<variant> always points at the newest nightly of the version
-          # pinned on main (release.yml seeds it from the version manifest)
-          docker manifest create "${IMAGE}:latest-${{ matrix.variant }}" \
-            "${IMAGE}:${TAG_PREFIX}-${{ matrix.variant }}-amd64" "${IMAGE}:${TAG_PREFIX}-${{ matrix.variant }}-arm64"
-          docker manifest annotate "${IMAGE}:latest-${{ matrix.variant }}" "${IMAGE}:${TAG_PREFIX}-${{ matrix.variant }}-amd64" --os linux --arch amd64
-          docker manifest annotate "${IMAGE}:latest-${{ matrix.variant }}" "${IMAGE}:${TAG_PREFIX}-${{ matrix.variant }}-arm64" --os linux --arch arm64
-          docker manifest push "${IMAGE}:latest-${{ matrix.variant }}"
+      - name: publish nightly + latest manifests per variant
+        run: |
+          variants=$(skopeo list-tags "docker://${IMAGE}" \
+            | jq -r --arg p "${TAG_PREFIX}-" '.Tags[] | select(startswith($p)) | select(endswith("-amd64"))
+                      | sub("^" + $p; "") | sub("-amd64$"; "")' | sort -u)
+          if [ -z "$variants" ]; then
+            echo "no ${TAG_PREFIX}-* images found — did push-images run?" >&2
+            exit 1
+          fi
+          for variant in $variants; do
+            for tag in "${TAG_PREFIX}-${variant}" "latest-${variant}"; do
+              docker manifest create "${IMAGE}:${tag}" \
+                "${IMAGE}:${TAG_PREFIX}-${variant}-amd64" "${IMAGE}:${TAG_PREFIX}-${variant}-arm64"
+              docker manifest annotate "${IMAGE}:${tag}" "${IMAGE}:${TAG_PREFIX}-${variant}-amd64" --os linux --arch amd64
+              docker manifest annotate "${IMAGE}:${tag}" "${IMAGE}:${TAG_PREFIX}-${variant}-arm64" --os linux --arch arm64
+              docker manifest push "${IMAGE}:${tag}"
+            done
+          done
 
   # One summary comment per PR run (updated in place on re-runs), instead of
   # one comment per matrix job.
   summarize:
     needs: [resolve, build, push-images]
-    if: always() && github.event_name == 'pull_request'
+    # fork PRs get a read-only token and cannot be commented on
+    if: always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -252,14 +274,14 @@ jobs:
           else
             status="⚠️ ${ok}/${total} build/push jobs passed; failed: ${failed:-—}"
           fi
+          variants=$(paste -sd', ' scripts/variants.txt)
           body="dbt ${DBT_VERSION} rock build summary: ${status}
 
-          Variants: bigquery, clickhouse, databricks, dbt, duckdb, mssql, postgresql, redshift, salesforce, spark, snowflake × amd64/arm64.
+          Variants: ${variants} × amd64/arm64.
           Images (when all passed): \`ghcr.io/${{ github.repository_owner }}/dbt:pr-${PR_NUMBER}-<variant>-<arch>\`"
-          existing=$(gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments?per_page=100" \
-            --jq '[.[] | select(.user.login == "github-actions[bot]")] | last | .id // empty')
-          if [ -n "$existing" ]; then
-            gh api --method PATCH "repos/${{ github.repository }}/issues/comments/${existing}" -f body="$body" >/dev/null
-          else
-            gh pr comment "$PR_NUMBER" --body "$body"
-          fi
+          # keep exactly one bot comment: delete previous ones, then post fresh
+          for id in $(gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments?per_page=100" \
+            --jq '[.[] | select(.user.login == "github-actions[bot]")] | .[].id'); do
+            gh api --method DELETE "repos/${{ github.repository }}/issues/comments/${id}" >/dev/null
+          done
+          gh pr comment "$PR_NUMBER" --body "$body"

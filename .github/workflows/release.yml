@@ -87,7 +87,8 @@ jobs:
           V: ${{ steps.ver.outputs.version }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          variants=$(paste -sd', ' scripts/variants.txt)
           git tag "$V" && git push origin "$V"
           gh release create "$V" \
             --title "dbt-rock ${V}" \
-            --notes "dbt OSS ${V} as chiselled rocks, one image per ADBC driver variant: \`ghcr.io/${{ github.repository_owner }}/dbt:${V}-<variant>\` (variants: bigquery, clickhouse, databricks, dbt, duckdb, mssql, postgresql, redshift, salesforce, spark, snowflake; \`duckdb\` ships both duckdb and duckdb_extended). \`latest-<variant>\` tracks the newest nightly of the latest version. Tarball and driver checksums: /var/lib/dbt/provenance in each image."
+            --notes "dbt OSS ${V} as chiselled rocks, one image per ADBC driver variant: \`ghcr.io/${{ github.repository_owner }}/dbt:${V}-<variant>\` (variants: ${variants}; \`duckdb\` ships both duckdb and duckdb_extended). \`latest-<variant>\` tracks the newest nightly of the latest version. Tarball and driver checksums: /var/lib/dbt/provenance in each image."

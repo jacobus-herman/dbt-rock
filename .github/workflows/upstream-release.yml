@@ -69,7 +69,9 @@ jobs:
           git checkout -b "$branch"
           git add rockcraft.yaml
           git commit -m "Bump dbt to ${DBT_VERSION}"
-          git push -u origin "$branch"
+          # force-with-lease: on re-runs the remote branch exists with an
+          # identical-content commit (different sha), so a plain push is rejected
+          git push -u origin "$branch" --force-with-lease
           # idempotent on re-runs: reuse the PR if this branch already has one
           number=$(gh pr list --head "$branch" --base "${BASE}" --json number --jq '.[0].number // empty')
           if [ -z "$number" ]; then

@@ -89,8 +89,10 @@ mkdir -p "$(dirname "$prov")"
   echo "tarball_sha256: $sha"
   # set by the nightly build workflow (digest of the floating build-base image)
   if [ -n "${DBT_BASE_DIGEST:-}" ]; then echo "build_base_digest: $DBT_BASE_DIGEST"; fi
-  echo "license: Apache-2.0 (dbt OSS); ADBC drivers: Apache-2.0 (arrow-adbc), duckdb MIT"
   echo "adbc_drivers: $DBT_ADBC_DRIVERS"
+  licenses="Apache-2.0 (arrow-adbc)"
+  case " $DBT_ADBC_DRIVERS " in *" duckdb "*|*" all "*) licenses="$licenses, MIT (duckdb)" ;; esac
+  echo "license: Apache-2.0 (dbt OSS); ADBC drivers: $licenses"
   if [ -d "$cache_dir" ]; then
     (cd "$cache_dir" && find . -name '*.so' -exec sha256sum {} +)
   fi

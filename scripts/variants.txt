@@ -1,0 +1,11 @@
+bigquery
+clickhouse
+databricks
+dbt
+duckdb
+mssql
+postgresql
+redshift
+salesforce
+spark
+snowflake

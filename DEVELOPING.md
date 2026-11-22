@@ -7,8 +7,9 @@ reproducible in CI; this harness exists to catch them earlier).
 
     sudo snap install rockcraft --channel=latest/stable --classic
     sudo apt-get install -y docker.io skopeo jq shellcheck
-    # actionlint validates the workflow files incl. GitHub expressions:
-    curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash | bash
+    # actionlint validates the workflow files incl. GitHub expressions
+    # (pinned to a release asset, same as the lint job in build.yml):
+    curl -fsSLo actionlint.tgz https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz && tar xzf actionlint.tgz actionlint && sudo mv actionlint /usr/local/bin/
 
 Plus: network access to `github.com`, `ghcr.io` and `public.cdn.getdbt.com`,
 and docker daemon running (`sudo systemctl start docker`, your user in the
