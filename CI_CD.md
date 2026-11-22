@@ -37,10 +37,10 @@ Variants: one per driver, with `duckdb` shipping both duckdb and duckdb_extended
    (override only with `DBT_ALLOW_VERSION_MISMATCH=1`).
 3. Lint: `shellcheck scripts/build.sh` and `rockcraft expand-extensions`.
 4. Build per variant x arch on matching runners:
-   `DBT_ADBC_DRIVERS=<drivers> sudo -E rockcraft pack --destructive-mode --build-for <arch> -o out/`
+   `sudo env DBT_VERSION=... DBT_SHA256_AMD64=... DBT_SHA256_ARM64=... DBT_ADBC_DRIVERS=<drivers> rockcraft pack --destructive-mode --build-for <arch> -o out/`
    (`--destructive-mode` chowns the unpacked rootfs, so it must run as root;
-   `-E` keeps the host env. Host env vars propagate into the build, so export
-   the `DBT_*` vars first.)
+   GitHub runner sudo ignores `-E`, so pass the `DBT_*` vars via `env`
+   explicitly. Host env propagates into the build.)
 5. Smoke test:
    `scripts/smoke-test.sh out/dbt_${DBT_VERSION}_<variant>_<arch>.rock "$DBT_VERSION" <drivers...>`
 6. Push each `.rock` with skopeo to `ghcr.io/<owner>/dbt:pr-<n>-<variant>-<arch>`
@@ -57,15 +57,18 @@ Variants: one per driver, with `duckdb` shipping both duckdb and duckdb_extended
 - `yq`, `shellcheck`, `skopeo`, `docker`
 - network access to `github.com` and `public.cdn.getdbt.com` (driver downloads
   at build time)
-- runners: `ubuntu-latest` (amd64) and `ubuntu-latest-arm` (arm64); the runner
+- runners: `ubuntu-latest` (amd64) and `ubuntu-26.04-arm` (arm64); the runner
   OS does not affect the rock content (rockcraft builds in its own container).
-  Note: GitHub has no queue timeout for hosted runners — `timeout-minutes`
-  only covers execution — so a `runs-on` label that matches no runner leaves
-  the job queued forever. If a label is wrong, cancel the run manually.
-  The arm64 label is valid but arm runners are a smaller shared pool, so arm
-  jobs may wait at "Waiting for a runner to pick up this job" while amd64 jobs
-  start immediately — expected, not a config error (build.yml uses
-  max-parallel: 22 so waiting arm jobs don't block amd64 ones).
+  Note: there is **no `ubuntu-latest-arm` label** (that alias exists only for
+  macOS) — Ubuntu arm64 runners only have versioned labels (`ubuntu-26.04-arm`,
+  `ubuntu-24.04-arm`, ...), so keep the arm label in sync with what
+  `ubuntu-latest` points to. GitHub has no queue timeout for hosted runners —
+  `timeout-minutes` only covers execution — so a `runs-on` label that matches
+  no runner leaves the job queued forever; cancel the run manually in that case.
+  Arm runners are also a smaller shared pool, so arm jobs may legitimately wait
+  at "Waiting for a runner to pick up this job" while amd64 jobs start
+  immediately (build.yml uses max-parallel: 22 so waiting arm jobs don't block
+  amd64 ones).
 
 ## Guardrails already enforced in the build
 

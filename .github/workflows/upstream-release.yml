@@ -37,7 +37,7 @@ jobs:
       sha_amd64: ${{ steps.up.outputs.sha_amd64 }}
       sha_arm64: ${{ steps.up.outputs.sha_arm64 }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - id: up
         run: bash scripts/check-upstream.sh
       - run: echo "upgrade=${{ steps.up.outputs.upgrade }} target=${{ steps.up.outputs.dbt_version }}"
@@ -55,7 +55,7 @@ jobs:
       SHA_ARM64: ${{ needs.check.outputs.sha_arm64 }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ env.BASE }}
       - name: Set version in rockcraft.yaml
