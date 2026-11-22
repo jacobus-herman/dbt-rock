@@ -77,7 +77,8 @@ jobs:
           bash scripts/check-upstream.sh --shas "$v" # appends sha_amd64/sha_arm64 to $GITHUB_OUTPUT
           {
             echo "version=$v"
-            echo "variants=$(jq -Rn '[inputs | select(. != "")]' scripts/variants.txt)"
+            # -c: GITHUB_OUTPUT values must be single-line, so compact JSON
+            echo "variants=$(jq -cRn '[inputs | select(. != "")]' scripts/variants.txt)"
             if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
               echo "kind=pr"
               echo "tag_prefix=pr-${{ github.event.pull_request.number }}"
