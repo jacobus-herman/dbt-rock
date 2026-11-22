@@ -107,9 +107,11 @@ jobs:
     # versioned labels; keep this in sync with what ubuntu-latest points to on x64.
     # The job runs inside Canonical's rockcraft image (rockcraft + umoci
     # preinstalled, runs as root so no sudo/snap needed); only small extras are
-    # apt-installed below. If the stable-26.04 tag ever disappears, use stable-24.04.
+    # apt-installed below. (No stable-26.04 tag exists yet — use stable-24.04;
+    # the container's Ubuntu version doesn't affect the rock, which is built
+    # from build-base: ubuntu@26.04.)
     runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-26.04-arm' || 'ubuntu-latest' }}
-    container: ghcr.io/canonical/rockcraft:stable-26.04
+    container: ghcr.io/canonical/rockcraft:stable-24.04
     services:
       docker: # for scripts/smoke-test.sh
         image: docker:dind

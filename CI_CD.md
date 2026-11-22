@@ -53,7 +53,8 @@ Variants: one per driver, with `duckdb` shipping both duckdb and duckdb_extended
 ## Runner requirements
 
 - build jobs run inside Canonical's rockcraft image
-  (`container: ghcr.io/canonical/rockcraft:stable-26.04`, root, no snap/sudo);
+  (`container: ghcr.io/canonical/rockcraft:stable-24.04` — no stable-26.04 tag
+  exists yet; root, no snap/sudo);
   only `git curl skopeo docker-cli` are apt-installed on top. Smoke tests get a
   docker daemon from a `docker:dind` job service (`DOCKER_HOST=tcp://localhost:2375`).
   If a rockcraft image tag is missing, fall back to the snap:
