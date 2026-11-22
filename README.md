@@ -44,8 +44,9 @@ arch, published as multi-arch manifests `ghcr.io/<owner>/dbt:<version>-<variant>
 `<version>`, `latest`, or combined `default` tag — every image names exactly
 one driver variant.
 
-    docker pull ghcr.io/<owner>/dbt:v2.0.11-duckdb       # duckdb + duckdb_extended
+    docker pull ghcr.io/<owner>/dbt:v2.0.11-duckdb       # release artifact
     docker pull ghcr.io/<owner>/dbt:v2.0.11-postgresql   # postgresql only
+    docker pull ghcr.io/<owner>/dbt:latest-duckdb        # newest nightly of the latest version
 
 The `<version>-<variant>` tags are immutable release artifacts. In addition, a
 nightly build re-publishes the pinned version with fresh Ubuntu base slices as
@@ -53,6 +54,8 @@ nightly build re-publishes the pinned version with fresh Ubuntu base slices as
 `nightly-20261122-a1b2c3d4e5f6-duckdb`) for security updates — the dbt binary
 and driver versions stay pinned. If the `ubuntu@26.04` base digest is unchanged,
 the nightly build is skipped so identical content is never re-tagged.
+`latest-<variant>` always points at the newest nightly of the latest dbt
+version (seeded from the release manifest, then re-pointed by each nightly).
 
 Accepted risk: the image sets
 `DBT_ALLOW_EXPERIMENTAL_ADAPTERS=true` because the postgresql adapter is

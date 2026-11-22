@@ -3,7 +3,8 @@
 # Runs when a PR to the default branch is merged. It reads the dbt version from
 # rockcraft.yaml, promotes the pr-<n>-<variant>-<arch> images that build.yml
 # pushed into multi-arch manifests ghcr.io/<owner>/dbt:<version>-<variant>
-# (no bare <version> or :latest tag — every image names its driver variant),
+# (no bare <version> or :latest tag), seeds ghcr.io/<owner>/dbt:latest-<variant>
+# from them (the nightly build re-points latest-<variant> at each new nightly),
 # deletes the temporary pr-<n> tags, and creates the git tag + GitHub release.
 # The .rock files are not attached to the GitHub release (22 rocks would exceed
 # asset limits) — pull them from ghcr instead.
@@ -72,6 +73,10 @@ jobs:
             docker manifest annotate "${IMAGE}:${V}-${variant}" "${IMAGE}:pr-${PR_NUMBER}-${variant}-amd64" --os linux --arch amd64
             docker manifest annotate "${IMAGE}:${V}-${variant}" "${IMAGE}:pr-${PR_NUMBER}-${variant}-arm64" --os linux --arch arm64
             docker manifest push "${IMAGE}:${V}-${variant}"
+            # seed latest-<variant> from the release manifest; the nightly build
+            # re-points it at each new nightly of the version pinned on main
+            docker manifest create "${IMAGE}:latest-${variant}" "${IMAGE}:${V}-${variant}"
+            docker manifest push "${IMAGE}:latest-${variant}"
             # temporary pr tags are no longer needed once the version manifest exists
             skopeo delete "docker://${IMAGE}:pr-${PR_NUMBER}-${variant}-amd64" || echo "warn: could not delete pr tag (amd64)"
             skopeo delete "docker://${IMAGE}:pr-${PR_NUMBER}-${variant}-arm64" || echo "warn: could not delete pr tag (arm64)"
@@ -85,4 +90,4 @@ jobs:
           git tag "$V" && git push origin "$V"
           gh release create "$V" \
             --title "dbt-rock ${V}" \
-            --notes "dbt OSS ${V} as chiselled rocks, one image per ADBC driver variant: \`ghcr.io/${{ github.repository_owner }}/dbt:${V}-<variant>\` (variants: bigquery, clickhouse, databricks, dbt, duckdb, mssql, postgresql, redshift, salesforce, spark, snowflake; \`duckdb\` ships both duckdb and duckdb_extended). Tarball and driver checksums: /var/lib/dbt/provenance in each image."
+            --notes "dbt OSS ${V} as chiselled rocks, one image per ADBC driver variant: \`ghcr.io/${{ github.repository_owner }}/dbt:${V}-<variant>\` (variants: bigquery, clickhouse, databricks, dbt, duckdb, mssql, postgresql, redshift, salesforce, spark, snowflake; \`duckdb\` ships both duckdb and duckdb_extended). \`latest-<variant>\` tracks the newest nightly of the latest version. Tarball and driver checksums: /var/lib/dbt/provenance in each image."

@@ -185,7 +185,7 @@ jobs:
           skopeo copy "docker-archive:rocks/dbt_${DBT_VERSION}_${{ matrix.variant }}_${{ matrix.arch }}.rock" \
             "docker://${IMAGE}:${TAG_PREFIX}-${{ matrix.variant }}-${{ matrix.arch }}"
           echo "pushed ${IMAGE}:${TAG_PREFIX}-${{ matrix.variant }}-${{ matrix.arch }}"
-      - name: publish nightly multi-arch manifest
+      - name: publish nightly multi-arch manifest + update latest-<variant>
         if: needs.resolve.outputs.kind == 'nightly'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -196,3 +196,10 @@ jobs:
           docker manifest annotate "${IMAGE}:${TAG_PREFIX}-${{ matrix.variant }}" "${IMAGE}:${TAG_PREFIX}-${{ matrix.variant }}-amd64" --os linux --arch amd64
           docker manifest annotate "${IMAGE}:${TAG_PREFIX}-${{ matrix.variant }}" "${IMAGE}:${TAG_PREFIX}-${{ matrix.variant }}-arm64" --os linux --arch arm64
           docker manifest push "${IMAGE}:${TAG_PREFIX}-${{ matrix.variant }}"
+          # latest-<variant> always points at the newest nightly of the version
+          # pinned on main (release.yml seeds it from the version manifest)
+          docker manifest create "${IMAGE}:latest-${{ matrix.variant }}" \
+            "${IMAGE}:${TAG_PREFIX}-${{ matrix.variant }}-amd64" "${IMAGE}:${TAG_PREFIX}-${{ matrix.variant }}-arm64"
+          docker manifest annotate "${IMAGE}:latest-${{ matrix.variant }}" "${IMAGE}:${TAG_PREFIX}-${{ matrix.variant }}-amd64" --os linux --arch amd64
+          docker manifest annotate "${IMAGE}:latest-${{ matrix.variant }}" "${IMAGE}:${TAG_PREFIX}-${{ matrix.variant }}-arm64" --os linux --arch arm64
+          docker manifest push "${IMAGE}:latest-${{ matrix.variant }}"

@@ -14,8 +14,11 @@ Implemented as three workflows:
   floating Ubuntu base slices pick up security fixes; the dbt binary and ADBC
   drivers stay pinned by checksum.
 - `.github/workflows/release.yml` — on PR merge: promotes the `pr-<n>` images
-  to multi-arch `<version>-<variant>` manifests, deletes the pr tags, creates
-  the git tag and GitHub release.
+  to multi-arch `<version>-<variant>` manifests, seeds `latest-<variant>` from
+  them, deletes the pr tags, creates the git tag and GitHub release.
+- `latest-<variant>` (e.g. `latest-duckdb`) always points at the newest nightly
+  of the latest dbt version: seeded from the release manifest at merge time,
+  then re-pointed by every nightly build.
 
 Pipeline shape: scheduled check for a new release tag in `dbt-labs/dbt` →
 release PR → per-variant per-arch build on the PR (images tagged
