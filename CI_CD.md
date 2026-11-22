@@ -47,7 +47,8 @@ Variants: one per driver, with `duckdb` shipping both duckdb and duckdb_extended
    build.)
 5. Smoke test:
    `scripts/smoke-test.sh out/dbt_${DBT_VERSION}_<variant>_<arch>.rock "$DBT_VERSION" <drivers...>`
-6. Push each `.rock` with skopeo to `ghcr.io/<owner>/dbt:pr-<n>-<variant>-<arch>`
+6. Push each `.rock` with skopeo (`oci-archive:` transport — .rock files are OCI
+   archives, not docker-archives) to `ghcr.io/<owner>/dbt:pr-<n>-<variant>-<arch>`
    (build.yml); release.yml on merge re-tags them into the multi-arch
    `<version>-<variant>` manifests. Registry credentials are the default
    GITHUB_TOKEN; there are no other secrets — releases are public and

@@ -182,7 +182,8 @@ jobs:
           echo "$GITHUB_TOKEN" | skopeo login ghcr.io -u "${{ github.actor }}" --password-stdin
           # PR builds: pr-<n>-... (no version tag; release.yml promotes on merge).
           # Nightly builds: nightly-<yyyymmdd>-... (fresh base slices, version stays pinned).
-          skopeo copy "docker-archive:rocks/dbt_${DBT_VERSION}_${{ matrix.variant }}_${{ matrix.arch }}.rock" \
+          # .rock files are OCI archives, hence the oci-archive: transport
+          skopeo copy "oci-archive:rocks/dbt_${DBT_VERSION}_${{ matrix.variant }}_${{ matrix.arch }}.rock" \
             "docker://${IMAGE}:${TAG_PREFIX}-${{ matrix.variant }}-${{ matrix.arch }}"
           echo "pushed ${IMAGE}:${TAG_PREFIX}-${{ matrix.variant }}-${{ matrix.arch }}"
       - name: publish nightly multi-arch manifest + update latest-<variant>

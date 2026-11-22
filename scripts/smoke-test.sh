@@ -6,7 +6,8 @@
 set -euo pipefail
 rock="$1"; want="$2"; shift 2
 img="dbt-smoke:ci"
-skopeo copy "docker-archive:$rock" "docker-daemon:$img"
+# .rock files are OCI archives (index.json), not docker-archive (manifest.json)
+skopeo copy "oci-archive:$rock" "docker-daemon:$img"
 docker run --rm --entrypoint /usr/bin/dbt "$img" --version | grep -q "${want#v}"
 ctr=$(docker create "$img")
 trap 'docker rm -f "$ctr" >/dev/null' EXIT
