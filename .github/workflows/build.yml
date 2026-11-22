@@ -39,6 +39,16 @@ env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/dbt
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: sudo apt-get update && sudo apt-get install -y shellcheck jq
+      - run: bash -n scripts/*.sh && shellcheck scripts/*.sh
+      - uses: rhysd/actionlint-action@v1
+        with:
+          args: .github/workflows/*.yml
+
   resolve:
     runs-on: ubuntu-latest
     outputs:
@@ -146,7 +156,8 @@ jobs:
             rockcraft pack --destructive-mode --build-for ${{ matrix.arch }} -o out/
           rock="out/dbt_${DBT_VERSION}_${{ matrix.arch }}.rock"
           sudo skopeo copy "oci-archive:${rock}:${DBT_VERSION}" "oci:.rocklayout:${DBT_VERSION}"
-          sudo /snap/rockcraft/current/bin/umoci config --image "oci:.rocklayout:${DBT_VERSION}" \
+          # NB: umoci's --image is a plain path:tag, no "oci:" prefix
+          sudo /snap/rockcraft/current/bin/umoci config --image ".rocklayout:${DBT_VERSION}" \
             --manifest.annotation "com.getdbt.adbc-driver=${DBT_ADBC_DRIVERS}"
           sudo skopeo copy "oci:.rocklayout:${DBT_VERSION}" "oci-archive:${rock}:${DBT_VERSION}"
           sudo rm -rf .rocklayout
