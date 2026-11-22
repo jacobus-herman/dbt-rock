@@ -17,7 +17,9 @@
 # duckdb_extended). If dbt adds a driver, add it to scripts/variants.txt.
 # To nightly-rebuild additional pinned dbt versions, add them as a matrix over
 # DBT_VERSION with DBT_ALLOW_VERSION_MISMATCH=1 (rockcraft.yaml keeps one version).
-name: build
+# NB: this name is the aggregate check run shown on PRs — require THIS in the
+# branch protection rule, not the individual matrix jobs.
+name: build rocks
 
 on:
   pull_request:
