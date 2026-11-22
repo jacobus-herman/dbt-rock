@@ -174,7 +174,9 @@ jobs:
           read -ra drivers <<<"$DBT_ADBC_DRIVERS"
           bash scripts/smoke-test.sh "out/dbt_${DBT_VERSION}_${{ matrix.variant }}_${{ matrix.arch }}.rock" "$DBT_VERSION" "${drivers[@]}"
       # no per-job PR comment here — the summarize job posts a single summary
-      - uses: actions/upload-artifact@v7
+      # must match the download-artifact major in push-images (artifact backend
+      # is per-major; a mismatch makes downloads report "artifact not found")
+      - uses: actions/upload-artifact@v8
         with:
           name: rock-${{ matrix.variant }}-${{ matrix.arch }}
           path: out/dbt_${DBT_VERSION}_${{ matrix.variant }}_${{ matrix.arch }}.rock
