@@ -212,6 +212,7 @@ jobs:
       PR_NUMBER: ${{ github.event.pull_request.number }}
       DBT_VERSION: ${{ needs.resolve.outputs.version }}
     steps:
+      - uses: actions/checkout@v6 # gh pr comment needs a git repo to resolve the PR
       - name: post single summary comment on the PR
         run: |
           jobs=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs?per_page=100" \
