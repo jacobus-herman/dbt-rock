@@ -134,7 +134,9 @@ jobs:
         # runner sudo ignores -E, so pass the DBT_* vars via `env` explicitly.
         # rockcraft does not create the -o dir itself. rockcraft 1.x has no custom
         # annotations key, so the variant annotation is added post-pack with the
-        # umoci bundled in the rockcraft snap, then the archive is re-exported.
+        # umoci bundled in the rockcraft snap: .rock archive -> OCI layout ->
+        # annotate -> back to archive (rockcraft's internal images/ layout is not
+        # reliable after export).
         run: |
           set -e
           mkdir -p out
@@ -142,10 +144,12 @@ jobs:
             DBT_SHA256_ARM64="$DBT_SHA256_ARM64" DBT_ADBC_DRIVERS="$DBT_ADBC_DRIVERS" \
             DBT_BASE_DIGEST="${DBT_BASE_DIGEST:-}" \
             rockcraft pack --destructive-mode --build-for ${{ matrix.arch }} -o out/
-          sudo /snap/rockcraft/current/bin/umoci config --image "oci:images/dbt:${DBT_VERSION}" \
+          rock="out/dbt_${DBT_VERSION}_${{ matrix.arch }}.rock"
+          sudo skopeo copy "oci-archive:${rock}:${DBT_VERSION}" "oci:.rocklayout:${DBT_VERSION}"
+          sudo /snap/rockcraft/current/bin/umoci config --image "oci:.rocklayout:${DBT_VERSION}" \
             --manifest.annotation "com.getdbt.adbc-driver=${DBT_ADBC_DRIVERS}"
-          sudo skopeo copy "oci:images/dbt:${DBT_VERSION}" \
-            "oci-archive:out/dbt_${DBT_VERSION}_${{ matrix.arch }}.rock:${DBT_VERSION}"
+          sudo skopeo copy "oci:.rocklayout:${DBT_VERSION}" "oci-archive:${rock}:${DBT_VERSION}"
+          sudo rm -rf .rocklayout
       - name: rename rock per variant
         run: mv "out/dbt_${DBT_VERSION}_${{ matrix.arch }}.rock" "out/dbt_${DBT_VERSION}_${{ matrix.variant }}_${{ matrix.arch }}.rock"
       - name: smoke test
