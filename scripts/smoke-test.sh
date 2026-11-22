@@ -20,6 +20,7 @@ done
 # at uid 584792), so a rockcraft change to that uid fails here instead of
 # silently making the cache read-only at runtime
 user=$(docker inspect --format '{{.Config.User}}' "$img")
-owner=$(docker export "$ctr" | tar -tv --wildcards '*/var/cache/dbt' | head -1 | awk '{print $2}' | cut -d/ -f1)
+# docker export tar entries have no leading slash, so the pattern must not start with */
+owner=$(docker export "$ctr" | tar -tv --wildcards 'var/cache/dbt' | head -1 | awk '{print $2}' | cut -d/ -f1)
 [ "$owner" = "$user" ] || { echo "cache dir owner $owner != image user $user" >&2; exit 1; }
 echo "smoke OK: $want"
