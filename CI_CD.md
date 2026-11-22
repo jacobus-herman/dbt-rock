@@ -50,8 +50,9 @@ Variants: one per driver, with `duckdb` shipping both duckdb and duckdb_extended
 
 ## Runner requirements
 
-- rockcraft pinned to the 1.x channel — this yaml uses 1.x schema
-  (`snap install rockcraft --channel=1.x/stable --classic`)
+- rockcraft from `latest/stable` — the snap has no `1.x` track; the yaml uses
+  the 1.x schema, which latest/stable still accepts
+  (`snap install rockcraft --channel=latest/stable --classic`)
 - `yq`, `shellcheck`, `skopeo`, `docker`
 - network access to `github.com` and `public.cdn.getdbt.com` (driver downloads
   at build time)

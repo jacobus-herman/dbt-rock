@@ -116,9 +116,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      - name: install rockcraft 1.x + skopeo
+      - name: install rockcraft + skopeo
         run: |
-          sudo snap install rockcraft --channel=1.x/stable --classic
+          # rockcraft is only published on latest/stable (there is no 1.x track);
+          # rockcraft.yaml uses the 1.x schema, which latest/stable still accepts
+          sudo snap install rockcraft --channel=latest/stable --classic
           sudo apt-get update && sudo apt-get install -y skopeo
       - name: pack rock
         run: rockcraft pack --destructive-mode --build-for ${{ matrix.arch }} -o out/
