@@ -47,6 +47,13 @@ one driver variant.
     docker pull ghcr.io/<owner>/dbt:v2.0.11-duckdb       # duckdb + duckdb_extended
     docker pull ghcr.io/<owner>/dbt:v2.0.11-postgresql   # postgresql only
 
+The `<version>-<variant>` tags are immutable release artifacts. In addition, a
+nightly build re-publishes the pinned version with fresh Ubuntu base slices as
+`ghcr.io/<owner>/dbt:nightly-<yyyymmdd>-<base-digest>-<variant>` (e.g.
+`nightly-20261122-a1b2c3d4e5f6-duckdb`) for security updates — the dbt binary
+and driver versions stay pinned. If the `ubuntu@26.04` base digest is unchanged,
+the nightly build is skipped so identical content is never re-tagged.
+
 Accepted risk: the image sets
 `DBT_ALLOW_EXPERIMENTAL_ADAPTERS=true` because the postgresql adapter is
 experimental in dbt OSS v2.

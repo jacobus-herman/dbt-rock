@@ -9,7 +9,10 @@ Implemented as three workflows:
 - `.github/workflows/build.yml` — on every PR to main: resolves version +
   SHA256s (`check-upstream.sh --shas`), builds one rock per ADBC driver
   variant x arch, smoke tests, and pushes `pr-<n>-<variant>-<arch>` images
-  (no version tag yet).
+  (no version tag yet). Also runs nightly (schedule, default branch): rebuilds
+  the version pinned on main as `nightly-<yyyymmdd>-<variant>` manifests so the
+  floating Ubuntu base slices pick up security fixes; the dbt binary and ADBC
+  drivers stay pinned by checksum.
 - `.github/workflows/release.yml` — on PR merge: promotes the `pr-<n>` images
   to multi-arch `<version>-<variant>` manifests, deletes the pr tags, creates
   the git tag and GitHub release.
@@ -52,6 +55,11 @@ Variants: one per driver, with `duckdb` shipping both duckdb and duckdb_extended
 - `yq`, `shellcheck`, `skopeo`, `docker`
 - network access to `github.com` and `public.cdn.getdbt.com` (driver downloads
   at build time)
+- runners: `ubuntu-latest` (amd64) and `ubuntu-latest-arm` (arm64); the runner
+  OS does not affect the rock content (rockcraft builds in its own container).
+  Note: GitHub has no queue timeout for hosted runners — `timeout-minutes`
+  only covers execution — so a `runs-on` label that matches no runner leaves
+  the job queued forever. If a label is wrong, cancel the run manually.
 
 ## Guardrails already enforced in the build
 
@@ -69,6 +77,8 @@ Variants: one per driver, with `duckdb` shipping both duckdb and duckdb_extended
 
 - `DBT_ALLOW_EXPERIMENTAL_ADAPTERS=true` ships the experimental postgresql
   adapter (required for the cached driver to load).
-- `build-base: ubuntu@24.04` floats with Ubuntu updates — good for security
-  patches, less bit-reproducible; rockcraft records the base digest in the OCI
-  annotations.
+- `build-base: ubuntu@26.04` floats with Ubuntu updates — good for security
+  patches, less bit-reproducible. The nightly build short-circuits when the
+  base digest is unchanged: the digest is embedded in the nightly tag
+  (`nightly-<yyyymmdd>-<digest12>-<variant>`) and recorded in the image's
+  /var/lib/dbt/provenance (bare-base rocks carry no base-digest OCI annotation).

@@ -87,6 +87,8 @@ mkdir -p "$(dirname "$prov")"
   echo "dbt_version: $ver"
   echo "tarball_url: $url"
   echo "tarball_sha256: $sha"
+  # set by the nightly build workflow (digest of the floating build-base image)
+  if [ -n "${DBT_BASE_DIGEST:-}" ]; then echo "build_base_digest: $DBT_BASE_DIGEST"; fi
   echo "license: Apache-2.0 (dbt OSS); ADBC drivers: Apache-2.0 (arrow-adbc), duckdb MIT"
   echo "adbc_drivers: $DBT_ADBC_DRIVERS"
   if [ -d "$cache_dir" ]; then
