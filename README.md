@@ -13,7 +13,7 @@ variables, so a pipeline can build any dbt OSS release:
 | `DBT_VERSION`      | `version:` in rockcraft.yaml (release tag, e.g. `v2.0.11`; bare `2.0.11` also accepted) | dbt release to package |
 | `DBT_SHA256_AMD64` | (required for amd64 builds)  | SHA256 of the x86_64 release tarball           |
 | `DBT_SHA256_ARM64` | (required for arm64 builds)  | SHA256 of the aarch64 release tarball          |
-| `DBT_ADBC_DRIVERS` | `postgresql duckdb`          | ADBC drivers kept in the image cache           |
+| `DBT_ADBC_DRIVERS` | (required — no default)      | ADBC drivers to cache: space-separated names, `all`, or `none` |
 
 The SHAs come from the release's `SHA256SUMS`. Example:
 
@@ -32,7 +32,20 @@ After packing, smoke test the rock:
 
     scripts/smoke-test.sh out/dbt_v2.0.11_amd64.rock v2.0.11 postgresql duckdb
 
-See `CI_CD.md` for the full pipeline. Accepted risk: the image sets
+See `CI_CD.md` for the full pipeline.
+
+## Image variants
+
+The pipeline builds one image per ADBC driver variant, per arch, tagged
+`ghcr.io/<owner>/dbt:<version>-<variant>-<arch>` and published as multi-arch
+manifests `<version>-<variant>`: `bigquery`, `clickhouse`, `databricks`, `dbt`,
+`duckdb` (ships both `duckdb` and `duckdb_extended`), `mssql`, `postgresql`,
+`redshift`, `salesforce`, `spark`, `snowflake`. There is deliberately no bare
+`<version>`, `latest`, or combined `default` tag — every image names exactly
+one driver variant.
+
+    docker pull ghcr.io/<owner>/dbt:v2.0.11-duckdb       # duckdb + duckdb_extended
+    docker pull ghcr.io/<owner>/dbt:v2.0.11-postgresql   # postgresql only Accepted risk: the image sets
 `DBT_ALLOW_EXPERIMENTAL_ADAPTERS=true` because the postgresql adapter is
 experimental in dbt OSS v2.
 

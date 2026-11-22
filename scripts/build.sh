@@ -10,7 +10,9 @@
 #   DBT_SHA256_ARM64   SHA256 of dbt-core-<ver>-aarch64-unknown-linux-gnu.tar.gz
 #                      Only the one for the arch being built is required; take
 #                      them from the release's SHA256SUMS file.
-#   DBT_ADBC_DRIVERS   Space-separated ADBC drivers to keep (default: "postgresql duckdb").
+#   DBT_ADBC_DRIVERS   Required, no default. Space-separated ADBC drivers to
+#                      cache, "all" to cache every driver, or "none" to ship
+#                      no cached drivers.
 set -euo pipefail
 
 yaml_version=$(sed -n 's/^version:[[:space:]]*"\([^"]*\)".*/\1/p' "$CRAFT_PART_BUILD/rockcraft.yaml" | head -n 1)
@@ -25,7 +27,7 @@ if [ "$ver" != "${yaml_version#v}" ] && [ "${DBT_ALLOW_VERSION_MISMATCH:-0}" != 
   exit 1
 fi
 tag="v${ver}"
-DBT_ADBC_DRIVERS="${DBT_ADBC_DRIVERS:-postgresql duckdb}"
+: "${DBT_ADBC_DRIVERS:?set DBT_ADBC_DRIVERS: space-separated drivers to cache, 'all', or 'none'}"
 
 # release tarballs are per-arch; checksums from the release's SHA256SUMS
 case "$CRAFT_ARCH_BUILD_FOR" in
@@ -51,23 +53,33 @@ if [ -f "$src_dir/LICENSE" ]; then
   install -Dm644 "$src_dir/LICENSE" "$CRAFT_PART_INSTALL/usr/share/doc/dbt/copyright"
 else
   curl -fsSL --retry 3 "https://raw.githubusercontent.com/dbt-labs/dbt/${tag}/LICENSE" \
-    -o "$CRAFT_PART_INSTALL/usr/share/doc/dbt/copyright"
+    | install -Dm644 /dev/stdin "$CRAFT_PART_INSTALL/usr/share/doc/dbt/copyright"
 fi
 
 # Pre-cache ADBC drivers so the runtime needs no CDN access.
-# install-drivers only fetches "all"; prune down to the adapters this
-# rock should ship (one driver per dbt project is the norm).
-XDG_CACHE_HOME="$CRAFT_PART_INSTALL/var/cache/dbt" \
-  "$CRAFT_PART_INSTALL/usr/bin/dbt" system install-drivers
-for so in "$CRAFT_PART_INSTALL/var/cache/dbt/com.getdbt/adbc/"*/*.so; do
-  base=$(basename "$so")
-  keep_it=0
-  for k in $DBT_ADBC_DRIVERS; do
-    case "$base" in "libadbc_driver_${k}-"*) keep_it=1 ;; esac
-  done
-  if [ "$keep_it" -eq 0 ]; then rm -f "$so"; fi
-done
-find "$CRAFT_PART_INSTALL/var/cache/dbt" -type d -empty -delete
+# "none" skips the download entirely; "all" keeps everything install-drivers
+# fetches; otherwise prune down to the listed adapters (one driver per dbt
+# project is the norm).
+cache_dir="$CRAFT_PART_INSTALL/var/cache/dbt"
+if [ "$DBT_ADBC_DRIVERS" != "none" ]; then
+  XDG_CACHE_HOME="$cache_dir" \
+    "$CRAFT_PART_INSTALL/usr/bin/dbt" system install-drivers
+  if [ "$DBT_ADBC_DRIVERS" != "all" ]; then
+    for so in "$cache_dir/com.getdbt/adbc/"*/*.so; do
+      base=$(basename "$so")
+      keep_it=0
+      for k in $DBT_ADBC_DRIVERS; do
+        # match libadbc_driver_<name>-<ver>.so and libadbc_driver_<name>_<variant>-<ver>.so,
+        # so e.g. "duckdb" also keeps duckdb_extended
+        case "$base" in
+          "libadbc_driver_${k}-"*|"libadbc_driver_${k}_"*) keep_it=1 ;;
+        esac
+      done
+      if [ "$keep_it" -eq 0 ]; then rm -f "$so"; fi
+    done
+    find "$cache_dir" -type d -empty -delete
+  fi
+fi
 # Record what was downloaded; the chisel manifest only covers the slices.
 prov="$CRAFT_PART_INSTALL/var/lib/dbt/provenance"
 mkdir -p "$(dirname "$prov")"
@@ -75,12 +87,17 @@ mkdir -p "$(dirname "$prov")"
   echo "dbt_version: $ver"
   echo "tarball_url: $url"
   echo "tarball_sha256: $sha"
-  echo "license: Apache-2.0 (dbt OSS); drivers: Apache-2.0 (arrow-adbc), MIT (duckdb)"
-  (cd "$CRAFT_PART_INSTALL/var/cache/dbt" && find . -name '*.so' -exec sha256sum {} +)
+  echo "license: Apache-2.0 (dbt OSS); ADBC drivers: Apache-2.0 (arrow-adbc), duckdb MIT"
+  echo "adbc_drivers: $DBT_ADBC_DRIVERS"
+  if [ -d "$cache_dir" ]; then
+    (cd "$cache_dir" && find . -name '*.so' -exec sha256sum {} +)
+  fi
 } > "$prov"
 # Writable only by the run user. rockcraft maps run-user _daemon_ to a fixed
 # uid/gid 584792 in every rock (rockcraft/usernames.py), so chown by number;
 # by name it would resolve to uid 1 in the build base and not match at runtime.
 # scripts/smoke-test.sh asserts this owner matches the image's configured user.
-chown -R 584792:584792 "$CRAFT_PART_INSTALL/var/cache/dbt"
-chmod -R u+rwX,go+rX "$CRAFT_PART_INSTALL/var/cache/dbt"
+if [ -d "$cache_dir" ]; then
+  chown -R 584792:584792 "$cache_dir"
+  chmod -R u+rwX,go+rX "$cache_dir"
+fi

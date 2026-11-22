@@ -1,0 +1,73 @@
+# Publish a merged release: runs on push to the default branch (main) and, if
+# the `version:` tag does not exist yet, promotes the per-variant per-arch
+# images that upstream-release.yml pushed from the release PR into multi-arch
+# manifests ghcr.io/<owner>/dbt:<version>-<variant> (no bare <version> or
+# :latest tag — every image names its driver variant explicitly). Then creates
+# the git tag and GitHub release.
+# The .rock files are not attached to the GitHub release (24 rocks would exceed
+# asset limits) — pull them from ghcr instead.
+name: release
+
+on:
+  push:
+    branches: [main] # keep in sync with the repo's default branch
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/dbt
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: resolve version from rockcraft.yaml
+        id: ver
+        run: |
+          v=$(sed -n 's/^version:[[:space:]]*"\([^"]*\)".*/\1/p' rockcraft.yaml | head -n 1)
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+      - name: skip if the tag already exists
+        id: skip
+        env:
+          V: ${{ steps.ver.outputs.version }}
+        run: |
+          if git ls-remote --exit-code origin "refs/tags/${V}" >/dev/null 2>&1; then
+            echo "tag ${V} already released; nothing to do"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: install skopeo
+        if: steps.skip.outputs.skip != 'true'
+        run: sudo apt-get update && sudo apt-get install -y skopeo
+      - name: publish multi-arch manifests per variant
+        if: steps.skip.outputs.skip != 'true'
+        env:
+          V: ${{ steps.ver.outputs.version }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GITHUB_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          echo "$GITHUB_TOKEN" | skopeo login ghcr.io -u "${{ github.actor }}" --password-stdin
+          # discover variants from the per-arch tags pushed by upstream-release.yml
+          variants=$(skopeo list-tags "docker://${IMAGE}" \
+            | jq -r --arg v "${V}" '.Tags[] | select(startswith($v + "-")) | select(endswith("-amd64"))
+                      | sub("^" + $v + "-"; "") | sub("-amd64$"; "")' | sort -u)
+          echo "variants: $variants"
+          for variant in $variants; do
+            docker manifest create "${IMAGE}:${V}-${variant}" \
+              "${IMAGE}:${V}-${variant}-amd64" "${IMAGE}:${V}-${variant}-arm64"
+            docker manifest annotate "${IMAGE}:${V}-${variant}" "${IMAGE}:${V}-${variant}-amd64" --os linux --arch amd64
+            docker manifest annotate "${IMAGE}:${V}-${variant}" "${IMAGE}:${V}-${variant}-arm64" --os linux --arch arm64
+            docker manifest push "${IMAGE}:${V}-${variant}"
+          done
+      - name: git tag + GitHub release
+        if: steps.skip.outputs.skip != 'true'
+        env:
+          V: ${{ steps.ver.outputs.version }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git tag "$V" && git push origin "$V"
+          gh release create "$V" \
+            --title "dbt-rock ${V}" \
+            --notes "dbt OSS ${V} as chiselled rocks, one image per ADBC driver variant: \`ghcr.io/${{ github.repository_owner }}/dbt:${V}-<variant>\` (variants: bigquery, clickhouse, databricks, dbt, duckdb, mssql, postgresql, redshift, salesforce, spark, snowflake; \`duckdb\` ships both duckdb and duckdb_extended). Tarball and driver checksums: /var/lib/dbt/provenance in each image."

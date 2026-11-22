@@ -1,0 +1,170 @@
+# Automated upstream-release pipeline (implements CI_CD.md).
+#
+# Daily (and on demand) checks whether dbt-labs/dbt has a newer stable release
+# than the `version:` pinned in rockcraft.yaml. If so it:
+#   1. check: resolve the release tag + tarball SHA256s from SHA256SUMS
+#   2. pr:    open a PR to the default branch from release/dbt-<version>
+#              with `version:` bumped to that tag
+#   3. build: for every ADBC driver variant x arch, pack a rock on the PR head
+#             (rockcraft 1.x) and smoke test it, then comment the result on the PR
+#   4. push-images: publish the verified rocks as
+#             ghcr.io/<owner>/dbt:<tag>-<variant>-<arch>
+#
+# release.yml (on push to main, after the PR merges) promotes each variant's
+# per-arch images to a multi-arch ghcr.io/<owner>/dbt:<tag>-<variant> manifest.
+# Nothing is released before the PR is merged.
+#
+# Variants: one image per ADBC driver ("duckdb" ships both duckdb and
+# duckdb_extended). If dbt adds a driver, add it to VARIANTS below.
+#
+# Only the default GITHUB_TOKEN is used (contents/pull-requests/packages write)
+# — releases are public and checksum-gated.
+name: upstream-release
+
+on:
+  schedule:
+    - cron: "0 6 * * *" # daily check for a new dbt OSS release
+  workflow_dispatch:
+
+concurrency:
+  group: upstream-release
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  pull-requests: write
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/dbt
+  BASE: ${{ github.event.repository.default_branch }}
+  VARIANTS: '["bigquery","clickhouse","databricks","dbt","duckdb","mssql","postgresql","redshift","salesforce","spark","snowflake"]'
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      upgrade: ${{ steps.up.outputs.upgrade }}
+      dbt_version: ${{ steps.up.outputs.dbt_version }}
+      sha_amd64: ${{ steps.up.outputs.sha_amd64 }}
+      sha_arm64: ${{ steps.up.outputs.sha_arm64 }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: up
+        run: bash scripts/check-upstream.sh
+      - run: echo "upgrade=${{ steps.up.outputs.upgrade }} target=${{ steps.up.outputs.dbt_version }}"
+
+  pr:
+    needs: check
+    if: needs.check.outputs.upgrade == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.pr.outputs.sha }}
+      branch: ${{ steps.pr.outputs.branch }}
+      number: ${{ steps.pr.outputs.number }}
+    env:
+      DBT_VERSION: ${{ needs.check.outputs.dbt_version }}
+      SHA_AMD64: ${{ needs.check.outputs.sha_amd64 }}
+      SHA_ARM64: ${{ needs.check.outputs.sha_arm64 }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BASE }}
+      - name: Set version in rockcraft.yaml
+        run: >-
+          sed -i -E "s/^(version:[[:space:]]*\")[^\"]*(\")/\1${DBT_VERSION}\2/" rockcraft.yaml
+      - id: pr
+        run: |
+          branch="release/dbt-${DBT_VERSION}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add rockcraft.yaml
+          git commit -m "Bump dbt to ${DBT_VERSION}"
+          git push -u origin "$branch"
+          # idempotent on re-runs: reuse the PR if this branch already has one
+          number=$(gh pr list --head "$branch" --base "${BASE}" --json number --jq '.[0].number // empty')
+          if [ -z "$number" ]; then
+            number=$(gh pr create --base "${BASE}" --head "$branch" \
+              --title "Release dbt ${DBT_VERSION}" \
+              --body "Automated bump of dbt OSS to ${DBT_VERSION}; builds one rock per ADBC driver variant (${VARIANTS}) x arch.
+
+              Tarball SHA256s taken from the release's SHA256SUMS:
+              - amd64: ${SHA_AMD64}
+              - arm64: ${SHA_ARM64}
+
+              The build verifies the download against these and records them in
+              /var/lib/dbt/provenance. Merge to publish the rocks." \
+              --json number --jq '.number')
+          fi
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "number=$number" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: [check, pr]
+    if: needs.check.outputs.upgrade == 'true'
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        variant: ${{ fromJSON(env.VARIANTS) }}
+        arch: [amd64, arm64]
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    env:
+      # host env propagates into the rockcraft build; build.sh verifies the
+      # tarball against these and requires DBT_VERSION == version: (the PR bump)
+      DBT_VERSION: ${{ needs.check.outputs.dbt_version }}
+      DBT_SHA256_AMD64: ${{ needs.check.outputs.sha_amd64 }}
+      DBT_SHA256_ARM64: ${{ needs.check.outputs.sha_arm64 }}
+      DBT_ADBC_DRIVERS: ${{ matrix.variant }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PR_NUMBER: ${{ needs.pr.outputs.number }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.pr.outputs.sha }}
+      - name: install rockcraft 1.x + skopeo
+        run: |
+          sudo snap install rockcraft --channel=1.x/stable --classic
+          sudo apt-get update && sudo apt-get install -y skopeo
+      - name: pack rock
+        run: rockcraft pack --destructive-mode --build-for ${{ matrix.arch }} -o out/
+      - name: rename rock per variant
+        run: mv "out/dbt_${DBT_VERSION}_${{ matrix.arch }}.rock" "out/dbt_${DBT_VERSION}_${{ matrix.variant }}_${{ matrix.arch }}.rock"
+      - name: smoke test
+        run: bash scripts/smoke-test.sh "out/dbt_${DBT_VERSION}_${{ matrix.variant }}_${{ matrix.arch }}.rock" "$DBT_VERSION" $DBT_ADBC_DRIVERS
+      - name: comment on PR
+        run: |
+          gh pr comment "$PR_NUMBER" --body "Built + smoke-tested variant \`${{ matrix.variant }}\` (${{ matrix.arch }}) for dbt ${DBT_VERSION}: dbt --version OK, ADBC drivers cached, cache ownership OK."
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rock-${{ matrix.variant }}-${{ matrix.arch }}
+          path: out/dbt_${DBT_VERSION}_${{ matrix.variant }}_${{ matrix.arch }}.rock
+
+  push-images:
+    needs: [check, pr, build]
+    if: needs.check.outputs.upgrade == 'true' && needs.build.result == 'success'
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        variant: ${{ fromJSON(env.VARIANTS) }}
+        arch: [amd64, arm64]
+    runs-on: ubuntu-latest
+    env:
+      DBT_VERSION: ${{ needs.check.outputs.dbt_version }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: rock-${{ matrix.variant }}-${{ matrix.arch }}
+          path: rocks
+      - name: push per-variant per-arch image
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GITHUB_TOKEN" | skopeo login ghcr.io -u "${{ github.actor }}" --password-stdin
+          skopeo copy "docker-archive:rocks/dbt_${DBT_VERSION}_${{ matrix.variant }}_${{ matrix.arch }}.rock" \
+            "docker://${IMAGE}:${DBT_VERSION}-${{ matrix.variant }}-${{ matrix.arch }}"
+          echo "pushed ${IMAGE}:${DBT_VERSION}-${{ matrix.variant }}-${{ matrix.arch }}"
