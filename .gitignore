@@ -1,1 +1,8 @@
 logs/
+# rockcraft pack --destructive-mode build dirs (local builds)
+out/
+parts/
+prime/
+stage/
+bundles/
+images/

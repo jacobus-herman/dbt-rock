@@ -1,0 +1,50 @@
+#!/bin/sh
+# Minimal `snap` CLI shim for the dbt-rock builder image.
+#
+# rockcraft/craft-parts fetch stage-snaps (rockcraft always stages the pebble
+# snap into a rock) by running `snap download <name> --channel <track/risk>`.
+# On a normal host that needs snapd; inside the GitHub job container there is
+# no snapd (and installing one is not possible without privileges), so this
+# shim resolves the snap from the public Snap Store API instead and writes
+# <name>_<revision>.snap into the current directory, exactly like
+# `snap download` does. craft-parts then unsquashfs-es it into the rock.
+#
+# Only `download` is implemented; anything else fails loudly.
+set -eu
+
+cmd="${1:-}"
+[ "$cmd" = "download" ] || {
+  echo "snap shim: only 'snap download' is implemented, got: $*" >&2
+  exit 1
+}
+shift
+name="${1:?usage: snap download <name> [--channel <track/risk>]}"
+shift
+channel="latest/stable"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --channel) channel="${2:?--channel needs a value}"; shift 2 ;;
+    --channel=*) channel="${1#--channel=}"; shift ;;
+    --arch) shift 2 ;; # the store API call is arch-scoped via uname below
+    *) shift ;;
+  esac
+done
+
+case "$(uname -m)" in
+  x86_64) arch=amd64 ;;
+  aarch64) arch=arm64 ;;
+  *) echo "snap shim: unsupported arch $(uname -m)" >&2; exit 1 ;;
+esac
+track="${channel%%/*}"
+risk="${channel##*/}"
+
+entry=$(curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
+  -H 'Snap-Device-Series: 16' -H "Snap-Device-Channel: ${channel}" \
+  "https://api.snapcraft.io/v2/snaps/info/${name}" \
+  | jq -r --arg a "$arch" --arg t "$track" --arg r "$risk" \
+    '.["channel-map"][] | select(.channel.track==$t and .channel.risk==$r and .channel.architecture==$a) | [.revision, .download.url] | @tsv')
+[ -n "$entry" ] || { echo "snap shim: no ${name} snap for ${arch} on ${channel}" >&2; exit 1; }
+rev=${entry%%	*}
+url=${entry#*	}
+curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 "$url" -o "${name}_${rev}.snap"
+echo "snap shim: downloaded ${name} rev ${rev} (${channel}, ${arch}) -> ${name}_${rev}.snap"

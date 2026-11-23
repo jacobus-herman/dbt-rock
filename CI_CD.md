@@ -1,6 +1,10 @@
 # CI/CD implementation notes
 
-Implemented as three workflows:
+Implemented as four workflows:
+
+- `.github/workflows/builder-image.yml` — builds and pushes the shared CI
+  builder image `ghcr.io/<owner>/dbt-rock-builder` (see "Builder image" below);
+  all other workflows run their jobs inside it.
 
 - `.github/workflows/upstream-release.yml` — daily schedule + manual dispatch
   (active once on the default branch). `scripts/check-upstream.sh` resolves
@@ -47,12 +51,12 @@ Variants: one per driver, with `duckdb` shipping both duckdb and duckdb_extended
    The build also self-checks this and fails on mismatch
    (override only with `DBT_ALLOW_VERSION_MISMATCH=1`).
 3. Lint: `shellcheck scripts/build.sh` and `rockcraft expand-extensions`.
-4. Build per variant x arch on the VM runner:
-   `mkdir -p out && sudo env DBT_VERSION=... DBT_SHA256_AMD64=... DBT_SHA256_ARM64=... DBT_ADBC_DRIVERS=<drivers> rockcraft pack --destructive-mode --build-for <arch> -o out/`
-   (`--destructive-mode` chowns the unpacked rootfs, so it needs root; GitHub
-   runner sudo ignores `-E`, so pass the `DBT_*` vars via `env` explicitly;
-   rockcraft does not create the `-o` dir itself. Host env propagates into the
-   build.)
+4. Build per variant x arch inside the builder image container (jobs run as
+   root, so no `sudo`):
+   `mkdir -p out && env DBT_VERSION=... DBT_SHA256_AMD64=... DBT_SHA256_ARM64=... DBT_ADBC_DRIVERS=<drivers> rockcraft pack --destructive-mode --build-for <arch> -o out/`
+   (`--destructive-mode` chowns the unpacked rootfs, so it needs root; pass the
+   `DBT_*` vars via `env` explicitly; rockcraft does not create the `-o` dir
+   itself. Host env propagates into the build.)
 5. Smoke test:
    `scripts/smoke-test.sh out/dbt_${DBT_VERSION}_<variant>_<arch>.rock "$DBT_VERSION" <drivers...>`
 6. Push each `.rock` with skopeo (`oci-archive:` transport — .rock files are OCI
@@ -62,20 +66,50 @@ Variants: one per driver, with `duckdb` shipping both duckdb and duckdb_extended
    GITHUB_TOKEN; there are no other secrets — releases are public and
    checksum-gated.
 
+## Builder image (all workflow jobs run inside it)
+
+All jobs of build.yml, release.yml and upstream-release.yml run inside
+`ghcr.io/<owner>/dbt-rock-builder:v1` (`builder/Dockerfile`, built and pushed
+by `.github/workflows/builder-image.yml`), so no step installs tools on the
+runner anymore. This also removes the flaky `snap install rockcraft` step:
+when snapd self-refreshes mid-install, the snap CLI fails with
+`Waiting for automatic snapd restart...` / `The operation was canceled.` even
+though the snap actually got installed.
+
+- rockcraft 1.x is distributed as a classic snap only — there is no public
+  `ghcr.io/canonical/rockcraft` OCI image — so the image vendors the snap the
+  same way the official `snapcore/snapcraft` image does: the `.snap` is
+  downloaded from the Snap Store API and `unsquashfs`-ed to
+  `/snap/rockcraft/current`. The snap's binaries request the core24 base
+  snap's ELF loader, so core24 is vendored at `/snap/core24/current` too.
+  `SNAP`/`SNAP_NAME=rockcraft` are set so rockcraft resolves its bundled
+  `umoci`/`skopeo` via `$SNAP/bin` exactly like under snapd; the binaries are
+  also symlinked into `/usr/local/bin`.
+- rockcraft stages the `pebble` snap into every rock by running
+  `snap download pebble`, which needs snapd on a host. A job container has no
+  snapd (and cannot run one unprivileged), so the image ships a `snap` shim
+  (`builder/snap-shim`) that implements `snap download` against the public
+  Snap Store API.
+- Also baked in (pinned versions): docker CLI (talks to the host daemon via the
+  `/var/run/docker.sock` that the runner mounts into job containers), `gh`,
+  `git`, `jq`, `curl`, `shellcheck`, `actionlint`.
+- The image is versioned separately from the dbt rocks, as its own GHCR
+  package `dbt-rock-builder`: `v1` + `latest` (mutable, rebuilt on pushes to
+  main that touch `builder/**` or the builder workflow) and `sha-<n>`
+  (immutable, for rollback). The workflows reference `:v1`. Bootstrap: the
+  first `:v1` is pushed by the first run on main; to validate a PR that
+  changes the builder before that, run `builder-image` manually on the PR
+  branch (workflow_dispatch pushes `:v1` from that branch).
+- Jobs run as root inside the container (rockcraft `--destructive-mode` chowns
+  the unpacked rootfs). The runner OS only picks the host that runs the
+  container, and the image is multi-arch (amd64 + arm64), so the arm64 build
+  cells use it too.
+
 ## Runner requirements
 
-- rockcraft is distributed as a snap only — there is no public
-  `ghcr.io/canonical/rockcraft` container image (those tags 404) — so build jobs
-  install it per run: `snap install rockcraft --channel=latest/stable --classic`
-  (no `1.x` track exists; latest/stable is 1.x and accepts the yaml's 1.x
-  schema). `docker` and `git` are preinstalled on the VM runners; only `skopeo`
-  is apt-installed. The runner OS does not affect the rock (rockcraft builds the
-  rootfs from `build-base` in its own container).
-- `yq`, `shellcheck` for linting
-- network access to `github.com`, `ghcr.io` and `public.cdn.getdbt.com` (driver
-  downloads at build time)
 - runners: `ubuntu-latest` (amd64) and `ubuntu-26.04-arm` (arm64); the runner
-  OS does not affect the rock content (rockcraft builds in its own container).
+  OS does not affect the rock content (rockcraft builds the rootfs from
+  `build-base` itself, inside the builder container).
   Note: there is **no `ubuntu-latest-arm` label** (that alias exists only for
   macOS) — Ubuntu arm64 runners only have versioned labels (`ubuntu-26.04-arm`,
   `ubuntu-24.04-arm`, ...), so keep the arm label in sync with what
@@ -86,6 +120,10 @@ Variants: one per driver, with `duckdb` shipping both duckdb and duckdb_extended
   at "Waiting for a runner to pick up this job" while amd64 jobs start
   immediately (build.yml uses max-parallel: 22 so waiting arm jobs don't block
   amd64 ones).
+- the runner mounts the workspace and `/var/run/docker.sock` into job
+  containers (smoke test + `docker manifest` commands use the host daemon)
+- network access to `github.com`, `ghcr.io` and `public.cdn.getdbt.com` (driver
+  downloads at build time); `api.snapcraft.io` only for builder-image builds
 
 ## Guardrails already enforced in the build
 

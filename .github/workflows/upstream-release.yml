@@ -27,10 +27,18 @@ permissions:
 
 env:
   BASE: ${{ github.event.repository.default_branch }}
+  # Both jobs run inside the shared builder image
+  # ghcr.io/<owner>/dbt-rock-builder:v1 (builder/Dockerfile, built by
+  # builder-image.yml), so gh/git/curl/jq are preinstalled.
 
 jobs:
   check:
     runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/${{ github.repository_owner }}/dbt-rock-builder:v1
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     outputs:
       upgrade: ${{ steps.up.outputs.upgrade }}
       dbt_version: ${{ steps.up.outputs.dbt_version }}
@@ -46,6 +54,11 @@ jobs:
     needs: check
     if: needs.check.outputs.upgrade == 'true'
     runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/${{ github.repository_owner }}/dbt-rock-builder:v1
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     outputs:
       branch: ${{ steps.pr.outputs.branch }}
       number: ${{ steps.pr.outputs.number }}
