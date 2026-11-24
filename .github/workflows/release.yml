@@ -1,25 +1,39 @@
 # Release publish (implements the release half of CI_CD.md).
 #
-# Runs when a PR to the default branch is merged. It reads the dbt version from
-# rockcraft.yaml, promotes the pr-<n>-<variant>-<arch> images that build.yml
-# pushed into multi-arch manifests ghcr.io/<owner>/dbt:<version>-<variant>
-# (no bare <version> or :latest tag), seeds ghcr.io/<owner>/dbt:latest-<variant>
-# from them (the nightly build re-points latest-<variant> at each new nightly),
+# Manually triggered on the default branch: Actions -> release -> Run workflow
+# (the UI only offers workflow_dispatch on the default branch; via CLI:
+# `gh workflow run release.yml --ref main`). The nightly scheduled run lives in
+# build.yml and stays automatic — this workflow is the human gate before a
+# version is published.
+#
+# It reads the dbt version from rockcraft.yaml on main, promotes the
+# pr-<n>-<variant>-<arch> images that build.yml pushed for the merged PR into
+# multi-arch manifests ghcr.io/<owner>/dbt:<version>-<variant> (no bare
+# <version> or :latest tag), seeds ghcr.io/<owner>/dbt:latest-<variant> from
+# them (the nightly build re-points latest-<variant> at each new nightly),
 # deletes the temporary pr-<n> tags via the Packages API (GHCR has no registry
-# DELETE endpoint; the package is repo-linked and workflow-published, so the
-# default GITHUB_TOKEN with packages: write can delete its versions), and
+# DELETE endpoint; the package must be linked to this repository — checked by a
+# preflight step — so the default GITHUB_TOKEN with packages: write can delete
+# its versions; the script uses the owner-scoped /users/<owner>/packages API
+# because the repo-scoped one 404s for user-namespace packages), and
 # creates the git tag + GitHub release.
+# Which PR to release is the optional pr_number input; by default it picks the
+# newest merged PR that still has pr-* images in GHCR. Idempotent: skips when
+# the version tag already exists.
 # The .rock files are not attached to the GitHub release (22 rocks would exceed
 # asset limits) — pull them from ghcr instead.
 name: release
 
 on:
-  pull_request:
-    types: [closed]
-    branches: [main] # keep in sync with the repo's default branch
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'Merged PR whose pr-<n>-* images to promote (default: newest merged PR that still has pr-* images in GHCR)'
+        required: false
+        type: string
 
 concurrency:
-  group: release-pr-${{ github.event.pull_request.number }}
+  group: release # one release at a time; queue manual runs instead of cancelling
 
 permissions:
   contents: write
@@ -39,7 +53,6 @@ env:
 
 jobs:
   release:
-    if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/${{ github.repository_owner }}/dbt-rock-builder:v1
@@ -47,9 +60,35 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     env:
-      PR_NUMBER: ${{ github.event.pull_request.number }}
+      PR_NUMBER_INPUT: ${{ github.event.inputs.pr_number }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GITHUB_REPOSITORY: ${{ github.repository }}
     steps:
       - uses: actions/checkout@v6
+      - name: resolve which merged PR to release
+        id: pr
+        run: |
+          if [ -n "${PR_NUMBER_INPUT}" ]; then
+            echo "pr_number input: ${PR_NUMBER_INPUT}"
+            echo "number=${PR_NUMBER_INPUT}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "$GH_TOKEN" | skopeo login ghcr.io -u "${{ github.actor }}" --password-stdin
+          # PR numbers that still have pr-<n>-* images in GHCR ...
+          tagged=$(skopeo list-tags "docker://${IMAGE}" \
+            | jq -r '.Tags[] | select(startswith("pr-")) | sub("^pr-"; "") | split("-")[0] | tonumber? // empty' \
+            | sort -un | jq -Rnc '[inputs | tonumber]')
+          # ... intersected with merged PRs, newest first
+          merged=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls?state=closed&per_page=100" \
+            --jq '[.[] | select(.merged_at != null) | .number]')
+          n=$(jq -rn --argjson t "$tagged" --argjson m "$merged" \
+            '$t | map(select(. as $n | $m | index($n))) | max // empty')
+          if [ -z "$n" ]; then
+            echo "no merged PR with pr-* images found in ${IMAGE}; pass the pr_number input explicitly" >&2
+            exit 1
+          fi
+          echo "releasing newest merged PR with pr-* images: PR #${n}"
+          echo "number=$n" >> "$GITHUB_OUTPUT"
       - name: resolve version from rockcraft.yaml
         id: ver
         run: |
@@ -64,11 +103,25 @@ jobs:
             echo "tag ${V} already released; nothing to do"
             echo "skip=true" >> "$GITHUB_OUTPUT"
           fi
+      # Fail fast if the Packages API cannot see the package: the package must
+      # be linked to this repo (package page -> Settings -> Repository ->
+      # Connect repository) for GITHUB_TOKEN to manage it, and for a
+      # user-namespace package the owner-scoped endpoint /users/<owner>/... must
+      # be used (the repo-scoped one 404s). cleanup-tags.sh does the same.
+      - name: verify the GHCR package is accessible via the Packages API
+        if: steps.skip.outputs.skip != 'true'
+        run: |
+          pkg="${IMAGE##*/}"; owner="${GITHUB_REPOSITORY%%/*}"
+          if ! gh api "users/${owner}/packages/container/${pkg}/versions?per_page=1" >/dev/null 2>&1; then
+            echo "::error::cannot list versions of ghcr.io/${owner}/${pkg} — link the package to ${GITHUB_REPOSITORY} (package page -> Settings -> Repository -> Connect repository) so GITHUB_TOKEN may manage it, then re-run."
+            exit 1
+          fi
       - name: promote pr images to version-tagged multi-arch manifests
         id: promote
         if: steps.skip.outputs.skip != 'true'
         env:
           V: ${{ steps.ver.outputs.version }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "$GITHUB_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
@@ -78,7 +131,16 @@ jobs:
             | jq -r --arg p "pr-${PR_NUMBER}-" '.Tags[] | select(startswith($p)) | select(endswith("-amd64"))
                       | sub("^" + $p; "") | sub("-amd64$"; "")' | sort -u)
           if [ -z "$variants" ]; then
-            echo "no pr-${PR_NUMBER}-* images found in ${IMAGE} — did the build workflow run?" >&2
+            # idempotency: a previous run may have promoted the version manifests
+            # already and deleted the pr-* tags before failing at a later step
+            existing=$(skopeo list-tags "docker://${IMAGE}" \
+              | jq -r --arg v "${V}-" '.Tags[] | select(startswith($v)) | select(endswith("-amd64"))
+                          | sub("^" + $v; "") | sub("-amd64$"; "")' | sort -u)
+            if [ -n "$existing" ]; then
+              echo "pr-${PR_NUMBER}-* images are gone but ${V}-* manifests already exist for: $existing — promotion already done, skipping"
+              exit 0
+            fi
+            echo "no pr-${PR_NUMBER}-* images found in ${IMAGE} and no ${V}-* manifests either — did the build workflow run?" >&2
             exit 1
           fi
           echo "variants: $variants"
@@ -95,22 +157,17 @@ jobs:
             skopeo copy --all "docker://${IMAGE}:${V}-${variant}" "docker://${IMAGE}:latest-${variant}"
           done
       # GHCR does not support the registry DELETE endpoint (skopeo delete fails
-      # with "unsupported"), so pr-* tags are removed via the Packages API.
-      # The dbt package is repository-linked and published by build.yml, so the
-      # repository has admin on it and the default GITHUB_TOKEN (packages: write)
-      # is allowed to delete versions. Deletes all pr-* tags of closed/merged
-      # PRs (stale orphans included); tags of still-open PRs are kept.
+      # with "unsupported"), so pr-* tags are removed via the Packages API
+      # (owner-scoped endpoint; the package must be linked to this repo for
+      # GITHUB_TOKEN (packages: write) to manage it). Deletes all pr-* tags of
+      # closed/merged PRs (stale orphans included); tags of still-open PRs are kept.
       - name: delete pr-* image tags via Packages API
         if: steps.skip.outputs.skip != 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
         run: bash scripts/cleanup-tags.sh "${IMAGE##*/}" pr
       - name: git tag + GitHub release
         if: steps.skip.outputs.skip != 'true'
         env:
           V: ${{ steps.ver.outputs.version }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           img="ghcr.io/${{ github.repository_owner }}/dbt"
           {

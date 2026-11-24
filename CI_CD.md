@@ -17,26 +17,36 @@ Implemented as four workflows:
   the version pinned on main as `nightly-<yyyymmdd>-<variant>` manifests so the
   floating Ubuntu base slices pick up security fixes; the dbt binary and ADBC
   drivers stay pinned by checksum.
-- `.github/workflows/release.yml` — on PR merge: promotes the `pr-<n>` images
-  to multi-arch `<version>-<variant>` manifests, seeds `latest-<variant>` from
-  them, creates the git tag and GitHub release. The temporary `pr-<n>` image
-  tags are deleted via the Packages REST API with the default `GITHUB_TOKEN`
-  (GHCR has no registry DELETE endpoint, so `skopeo delete` fails with
-  "unsupported"; the dbt package is repo-linked and workflow-published, so
-  the repository has admin on it and the token may delete versions).
+- `.github/workflows/release.yml` — manually triggered on main (Actions →
+  release → Run workflow, or `gh workflow run release.yml --ref main`; the
+  optional `pr_number` input defaults to the newest merged PR that still has
+  `pr-*` images in GHCR): promotes the `pr-<n>` images to multi-arch
+  `<version>-<variant>` manifests, seeds `latest-<variant>` from them, creates
+  the git tag and GitHub release. The temporary `pr-<n>` image tags are
+  deleted via the Packages REST API with the default `GITHUB_TOKEN` (GHCR has
+  no registry DELETE endpoint, so `skopeo delete` fails with "unsupported").
+  This requires the dbt GHCR package to be **linked to the repository**
+  (one-time setup: package page → Settings → Repository → Connect repository →
+  this repo; release.yml has a preflight step that fails fast if not). Because
+  the package lives in a user namespace, the script must use the owner-scoped
+  endpoint `/users/<owner>/packages/container/<pkg>/versions` — the repo-scoped
+  `/repos/<owner>/<repo>/packages/...` 404s for user-namespace packages even
+  when linked. Idempotent: skips when the
+  version tag already exists. The nightly scheduled run is unaffected — it
+  lives in build.yml.
 - GHCR has no native retention UI, so `build.yml`'s nightly run also prunes
   via the same API (`scripts/cleanup-tags.sh`): all `pr-*` tags of closed/merged
   PRs (tags of still-open PRs are kept) and all but the newest 60 `nightly-*`
   package versions.
 - `latest-<variant>` (e.g. `latest-duckdb`) always points at the newest nightly
-  of the latest dbt version: seeded from the release manifest at merge time,
-  then re-pointed by every nightly build.
+  of the latest dbt version: seeded from the release manifest by a manual
+  release.yml run on main, then re-pointed by every nightly build.
 
 Pipeline shape: scheduled check for a new release tag in `dbt-labs/dbt` →
 release PR → per-variant per-arch build on the PR (images tagged
-`pr-<n>-<variant>-<arch>`) → on merge, promote to multi-arch
-`<version>-<variant>` manifests (no bare `<version>`, `latest`, or combined
-default tag — every image names exactly one driver variant).
+`pr-<n>-<variant>-<arch>`) → manual `release` run on main promotes them to
+multi-arch `<version>-<variant>` manifests (no bare `<version>`, `latest`, or
+combined default tag — every image names exactly one driver variant).
 Variants: one per driver, with `duckdb` shipping both duckdb and duckdb_extended.
 
 ## Steps (per dbt release tag, e.g. `v2.0.11`)
@@ -61,10 +71,16 @@ Variants: one per driver, with `duckdb` shipping both duckdb and duckdb_extended
    `scripts/smoke-test.sh out/dbt_${DBT_VERSION}_<variant>_<arch>.rock "$DBT_VERSION" <drivers...>`
 6. Push each `.rock` with skopeo (`oci-archive:` transport — .rock files are OCI
    archives, not docker-archives) to `ghcr.io/<owner>/dbt:pr-<n>-<variant>-<arch>`
-   (build.yml); release.yml on merge re-tags them into the multi-arch
-   `<version>-<variant>` manifests. Registry credentials are the default
-   GITHUB_TOKEN; there are no other secrets — releases are public and
+   (build.yml); a manual release.yml run on main re-tags them into the
+   multi-arch `<version>-<variant>` manifests. Registry credentials are the
+   default GITHUB_TOKEN; there are no other secrets — releases are public and
    checksum-gated.
+7. After the release PR is merged, publish manually on main:
+   `gh workflow run release.yml --ref main` (or Actions → release → Run
+   workflow; optionally pass the `pr_number` input). The run promotes the
+   `pr-<n>-*` images to `<version>-<variant>` manifests, seeds
+   `latest-<variant>`, deletes the `pr-*` tags, and creates the git tag +
+   GitHub release. It skips itself if the version tag already exists.
 
 ## Builder image (all workflow jobs run inside it)
 
