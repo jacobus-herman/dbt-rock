@@ -41,9 +41,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # The runner bind-mounts the workspace into the job container owned by the
 # runner uid, while the container runs as root — git then refuses the repo
-# ("detected dubious ownership") for every git/gh call in a step. The
-# container is an ephemeral CI sandbox, so allow any repo path for root.
-RUN git config --global --add safe.directory '*'
+# ("detected dubious ownership") for every git/gh call in a step. The runner
+# also sets HOME=/github/home (a mounted temp dir), so a --global entry in
+# /root/.gitconfig is never read; the system config /etc/gitconfig always is.
+# The container is an ephemeral CI sandbox, so allow any repo path.
+RUN git config --system --add safe.directory '*'
 
 # docker CLI (static build) — talks to the host daemon through the
 # /var/run/docker.sock that the Actions runner mounts into job containers.
