@@ -4,8 +4,9 @@
 # - pull_request to the default branch (opened/synchronize/reopened): build
 #   every ADBC driver variant x arch on the PR head, smoke test, comment on
 #   the PR, and push the rocks as ghcr.io/<owner>/dbt:pr-<n>-<variant>-<arch>.
-#   Images are deliberately NOT tagged with the dbt version here — release.yml
-#   promotes the pr-<n> images to <version>-<variant> manifests on merge.
+#   Images are deliberately NOT tagged with the dbt version here — a manual run
+#   of release.yml on main promotes the pr-<n> images to <version>-<variant>
+#   manifests.
 # - schedule (nightly, default branch only): rebuild the version pinned in
 #   rockcraft.yaml so the floating Ubuntu base slices pick up security fixes.
 #   The dbt binary and ADBC drivers are immutable pinned artifacts; only the
@@ -239,7 +240,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "$GITHUB_TOKEN" | skopeo login ghcr.io -u "${{ github.actor }}" --password-stdin
-          # PR builds: pr-<n>-... (no version tag; release.yml promotes on merge).
+          # PR builds: pr-<n>-... (no version tag; a manual release.yml run on
+          # main promotes them).
           # Nightly builds: nightly-<yyyymmdd>-... (fresh base slices, version stays pinned).
           # .rock files are OCI archives, hence the oci-archive: transport
           skopeo copy "oci-archive:rocks/dbt_${DBT_VERSION}_${{ matrix.variant }}_${{ matrix.arch }}.rock" \
@@ -249,8 +251,8 @@ jobs:
   # Nightly only: publish the multi-arch manifests after ALL arch cells of
   # push-images finished (running this per-cell raced on the same tag and could
   # reference a not-yet-pushed sibling arch). latest-<variant> points at the
-  # newest nightly of the version pinned on main (release.yml seeds it from the
-  # release manifest at merge time).
+  # newest nightly of the version pinned on main (a manual release.yml run on
+  # main seeds it from the release manifest).
   publish-manifests:
     needs: [resolve, push-images]
     if: needs.resolve.outputs.kind == 'nightly' && needs.push-images.result == 'success'

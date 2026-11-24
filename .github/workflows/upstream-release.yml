@@ -4,8 +4,8 @@
 # than the `version:` pinned in rockcraft.yaml. If so it opens a PR to the
 # default branch from release/dbt-<version> with `version:` bumped to that tag.
 # The build.yml workflow builds + smoke tests + pushes per-variant images on
-# that PR (tagged pr-<n>-...), and release.yml publishes the version-tagged
-# manifests once the PR is merged.
+# that PR (tagged pr-<n>-...); after the PR is merged, a manual run of
+# release.yml on main publishes the version-tagged manifests.
 #
 # Note: schedule/workflow_dispatch only fire once this file is on the default
 # branch. Only the default GITHUB_TOKEN is used (contents/pull-requests write)
@@ -95,7 +95,7 @@ jobs:
           if [ -z "$number" ]; then
             number=$(gh pr create --base "${BASE}" --head "$branch" \
               --title "Release dbt ${DBT_VERSION}" \
-              --body "Automated bump of dbt OSS to ${DBT_VERSION}. The build workflow will pack one rock per ADBC driver variant x arch and push them as \`pr-<n>-<variant>-<arch>\` images; merging publishes the \`${DBT_VERSION}-<variant>\` manifests.
+              --body "Automated bump of dbt OSS to ${DBT_VERSION}. The build workflow will pack one rock per ADBC driver variant x arch and push them as \`pr-<n>-<variant>-<arch>\` images; after merging, run the release workflow on main to publish the \`${DBT_VERSION}-<variant>\` manifests.
 
               Tarball SHA256s taken from the release's SHA256SUMS:
               - amd64: ${SHA_AMD64}

@@ -1,25 +1,37 @@
 # Release publish (implements the release half of CI_CD.md).
 #
-# Runs when a PR to the default branch is merged. It reads the dbt version from
-# rockcraft.yaml, promotes the pr-<n>-<variant>-<arch> images that build.yml
-# pushed into multi-arch manifests ghcr.io/<owner>/dbt:<version>-<variant>
-# (no bare <version> or :latest tag), seeds ghcr.io/<owner>/dbt:latest-<variant>
-# from them (the nightly build re-points latest-<variant> at each new nightly),
+# Manually triggered on the default branch: Actions -> release -> Run workflow
+# (the UI only offers workflow_dispatch on the default branch; via CLI:
+# `gh workflow run release.yml --ref main`). The nightly scheduled run lives in
+# build.yml and stays automatic — this workflow is the human gate before a
+# version is published.
+#
+# It reads the dbt version from rockcraft.yaml on main, promotes the
+# pr-<n>-<variant>-<arch> images that build.yml pushed for the merged PR into
+# multi-arch manifests ghcr.io/<owner>/dbt:<version>-<variant> (no bare
+# <version> or :latest tag), seeds ghcr.io/<owner>/dbt:latest-<variant> from
+# them (the nightly build re-points latest-<variant> at each new nightly),
 # deletes the temporary pr-<n> tags via the Packages API (GHCR has no registry
 # DELETE endpoint; the package is repo-linked and workflow-published, so the
 # default GITHUB_TOKEN with packages: write can delete its versions), and
 # creates the git tag + GitHub release.
+# Which PR to release is the optional pr_number input; by default it picks the
+# newest merged PR that still has pr-* images in GHCR. Idempotent: skips when
+# the version tag already exists.
 # The .rock files are not attached to the GitHub release (22 rocks would exceed
 # asset limits) — pull them from ghcr instead.
 name: release
 
 on:
-  pull_request:
-    types: [closed]
-    branches: [main] # keep in sync with the repo's default branch
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'Merged PR whose pr-<n>-* images to promote (default: newest merged PR that still has pr-* images in GHCR)'
+        required: false
+        type: string
 
 concurrency:
-  group: release-pr-${{ github.event.pull_request.number }}
+  group: release # one release at a time; queue manual runs instead of cancelling
 
 permissions:
   contents: write
@@ -39,7 +51,6 @@ env:
 
 jobs:
   release:
-    if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/${{ github.repository_owner }}/dbt-rock-builder:v1
@@ -47,9 +58,35 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     env:
-      PR_NUMBER: ${{ github.event.pull_request.number }}
+      PR_NUMBER_INPUT: ${{ github.event.inputs.pr_number }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GITHUB_REPOSITORY: ${{ github.repository }}
     steps:
       - uses: actions/checkout@v6
+      - name: resolve which merged PR to release
+        id: pr
+        run: |
+          if [ -n "${PR_NUMBER_INPUT}" ]; then
+            echo "pr_number input: ${PR_NUMBER_INPUT}"
+            echo "number=${PR_NUMBER_INPUT}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "$GH_TOKEN" | skopeo login ghcr.io -u "${{ github.actor }}" --password-stdin
+          # PR numbers that still have pr-<n>-* images in GHCR ...
+          tagged=$(skopeo list-tags "docker://${IMAGE}" \
+            | jq -r '.Tags[] | select(startswith("pr-")) | sub("^pr-"; "") | split("-")[0] | tonumber? // empty' \
+            | sort -un | jq -Rnc '[inputs | tonumber]')
+          # ... intersected with merged PRs, newest first
+          merged=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls?state=closed&per_page=100" \
+            --jq '[.[] | select(.merged_at != null) | .number]')
+          n=$(jq -rn --argjson t "$tagged" --argjson m "$merged" \
+            '$t | map(select(. as $n | $m | index($n))) | max // empty')
+          if [ -z "$n" ]; then
+            echo "no merged PR with pr-* images found in ${IMAGE}; pass the pr_number input explicitly" >&2
+            exit 1
+          fi
+          echo "releasing newest merged PR with pr-* images: PR #${n}"
+          echo "number=$n" >> "$GITHUB_OUTPUT"
       - name: resolve version from rockcraft.yaml
         id: ver
         run: |
@@ -69,6 +106,7 @@ jobs:
         if: steps.skip.outputs.skip != 'true'
         env:
           V: ${{ steps.ver.outputs.version }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "$GITHUB_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
@@ -102,15 +140,11 @@ jobs:
       # PRs (stale orphans included); tags of still-open PRs are kept.
       - name: delete pr-* image tags via Packages API
         if: steps.skip.outputs.skip != 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
         run: bash scripts/cleanup-tags.sh "${IMAGE##*/}" pr
       - name: git tag + GitHub release
         if: steps.skip.outputs.skip != 'true'
         env:
           V: ${{ steps.ver.outputs.version }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           img="ghcr.io/${{ github.repository_owner }}/dbt"
           {
