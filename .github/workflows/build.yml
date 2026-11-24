@@ -39,23 +39,46 @@ permissions:
   actions: write # required for upload-artifact/download-artifact; any declared
                   # permissions block sets all undeclared ones to "none"
 
+# run steps execute with bash — job containers default to sh (dash), and some
+# steps use bash features (here-strings, arrays)
+defaults:
+  run:
+    shell: bash
+
 env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/dbt
+  # Every job below runs inside the shared builder image
+  # ghcr.io/<owner>/dbt-rock-builder:v1 (builder/Dockerfile, built and pushed
+  # by builder-image.yml), so no step installs tools on the runner anymore —
+  # the old `snap install rockcraft` step was flaky because snapd
+  # self-refreshes mid-install and the snap CLI then fails with
+  # "The operation was canceled.". Jobs run as root inside the container; the
+  # runner mounts the workspace and /var/run/docker.sock into it, so
+  # docker/skopeo work against the host daemon. The image is multi-arch
+  # (amd64 + arm64), so the arm64 build cells can use it too.
 
 jobs:
   lint:
     runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/${{ github.repository_owner }}/dbt-rock-builder:v1
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v6
-      - run: sudo apt-get update && sudo apt-get install -y shellcheck jq
       - run: bash -n scripts/*.sh && shellcheck scripts/*.sh
-      # install actionlint pinned to a release (never curl|bash a moving branch);
-      # validates workflow syntax incl. expression contexts
-      - run: curl -fsSLo actionlint.tgz https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz && tar xzf actionlint.tgz actionlint
-      - run: ./actionlint .github/workflows/*.yml
+      # actionlint is baked into the builder image (pinned to a release, never
+      # curl|bash a moving branch); validates workflow syntax incl. expressions
+      - run: actionlint .github/workflows/*.yml
 
   resolve:
     runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/${{ github.repository_owner }}/dbt-rock-builder:v1
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     outputs:
       version: ${{ steps.r.outputs.version }}
       sha_amd64: ${{ steps.r.outputs.sha_amd64 }}
@@ -71,8 +94,6 @@ jobs:
       - uses: actions/checkout@v6
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      - name: install skopeo
-        run: sudo apt-get update && sudo apt-get install -y skopeo
       - id: r
         run: |
           v=$(sed -n 's/^version:[[:space:]]*"\([^"]*\)".*/\1/p' rockcraft.yaml | head -n 1)
@@ -121,13 +142,18 @@ jobs:
         variant: ${{ fromJSON(needs.resolve.outputs.variants) }}
         arch: [amd64, arm64]
     # runner OS is irrelevant to the rock content (rockcraft builds the rootfs
-    # from build-base in its own container). NB: there is NO 'ubuntu-latest-arm'
-    # label (unlike macOS) — Ubuntu arm64 runners only have versioned labels;
-    # keep this in sync with what ubuntu-latest points to on x64.
-    # rockcraft is distributed as a snap (latest/stable) — there is no public
-    # ghcr.io/canonical/rockcraft image — so install it per run; docker and git
-    # are preinstalled on the VM runners.
+    # from build-base itself). NB: there is NO 'ubuntu-latest-arm' label
+    # (unlike macOS) — Ubuntu arm64 runners only have versioned labels; keep
+    # this in sync with what ubuntu-latest points to on x64. The job runs
+    # inside the builder image (rockcraft vendored from its snap, plus
+    # skopeo/umoci/docker CLIs) as root — the runner OS only picks the host
+    # that runs the container, and the builder image is multi-arch.
     runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-26.04-arm' || 'ubuntu-latest' }}
+    container:
+      image: ghcr.io/${{ github.repository_owner }}/dbt-rock-builder:v1
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     env:
       # host env propagates into the rockcraft build; build.sh verifies the
       # tarball against these and requires DBT_VERSION == version: in rockcraft.yaml
@@ -141,34 +167,30 @@ jobs:
       - uses: actions/checkout@v6
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      - name: install rockcraft (snap) + skopeo
-        run: |
-          # rockcraft has no 1.x snap track; latest/stable is 1.x (1.21.x) and
-          # accepts the yaml's 1.x schema
-          sudo snap install rockcraft --channel=latest/stable --classic
-          sudo apt-get update && sudo apt-get install -y skopeo
+      # rockcraft, skopeo and umoci all come from the builder image; the job
+      # container runs as root, which --destructive-mode needs (it chowns the
+      # unpacked rootfs). Pass the DBT_* vars via `env` explicitly so they
+      # reach the rockcraft process regardless of env handling.
       - name: pack rock + annotate the ADBC driver variant
-        # --destructive-mode chowns the unpacked rootfs, so it needs root; GitHub
-        # runner sudo ignores -E, so pass the DBT_* vars via `env` explicitly.
         # rockcraft does not create the -o dir itself. rockcraft 1.x has no custom
         # annotations key, so the variant annotation is added post-pack with the
-        # umoci bundled in the rockcraft snap: .rock archive -> OCI layout ->
+        # umoci bundled in the builder image: .rock archive -> OCI layout ->
         # annotate -> back to archive (rockcraft's internal images/ layout is not
         # reliable after export).
         run: |
           set -e
           mkdir -p out
-          sudo env DBT_VERSION="$DBT_VERSION" DBT_SHA256_AMD64="$DBT_SHA256_AMD64" \
+          env DBT_VERSION="$DBT_VERSION" DBT_SHA256_AMD64="$DBT_SHA256_AMD64" \
             DBT_SHA256_ARM64="$DBT_SHA256_ARM64" DBT_ADBC_DRIVERS="$DBT_ADBC_DRIVERS" \
             DBT_BASE_DIGEST="${DBT_BASE_DIGEST:-}" \
             rockcraft pack --destructive-mode --build-for ${{ matrix.arch }} -o out/
           rock="out/dbt_${DBT_VERSION}_${{ matrix.arch }}.rock"
-          sudo skopeo copy "oci-archive:${rock}:${DBT_VERSION}" "oci:.rocklayout:${DBT_VERSION}"
+          skopeo copy "oci-archive:${rock}:${DBT_VERSION}" "oci:.rocklayout:${DBT_VERSION}"
           # NB: umoci's --image is a plain path:tag, no "oci:" prefix
-          sudo /snap/rockcraft/current/bin/umoci config --image ".rocklayout:${DBT_VERSION}" \
+          umoci config --image ".rocklayout:${DBT_VERSION}" \
             --manifest.annotation "com.getdbt.adbc-driver=${DBT_ADBC_DRIVERS}"
-          sudo skopeo copy "oci:.rocklayout:${DBT_VERSION}" "oci-archive:${rock}:${DBT_VERSION}"
-          sudo rm -rf .rocklayout
+          skopeo copy "oci:.rocklayout:${DBT_VERSION}" "oci-archive:${rock}:${DBT_VERSION}"
+          rm -rf .rocklayout
       - name: rename rock per variant
         run: mv "out/dbt_${DBT_VERSION}_${{ matrix.arch }}.rock" "out/dbt_${DBT_VERSION}_${{ matrix.variant }}_${{ matrix.arch }}.rock"
       - name: smoke test
@@ -198,6 +220,11 @@ jobs:
         variant: ${{ fromJSON(needs.resolve.outputs.variants) }}
         arch: [amd64, arm64]
     runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/${{ github.repository_owner }}/dbt-rock-builder:v1
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     env:
       DBT_VERSION: ${{ needs.resolve.outputs.version }}
       TAG_PREFIX: ${{ needs.resolve.outputs.tag_prefix }}
@@ -228,13 +255,17 @@ jobs:
     needs: [resolve, push-images]
     if: needs.resolve.outputs.kind == 'nightly' && needs.push-images.result == 'success'
     runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/${{ github.repository_owner }}/dbt-rock-builder:v1
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     env:
       TAG_PREFIX: ${{ needs.resolve.outputs.tag_prefix }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - name: install skopeo, login
+      - name: login
         run: |
-          sudo apt-get update && sudo apt-get install -y skopeo
           echo "$GITHUB_TOKEN" | skopeo login ghcr.io -u "${{ github.actor }}" --password-stdin
           echo "$GITHUB_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
       - name: publish nightly + latest manifests per variant
@@ -256,6 +287,28 @@ jobs:
             done
           done
 
+  # GHCR has no native retention UI, so prune here: delete pr-* tags of
+  # closed/merged PRs (stale orphans included; open PRs are kept) and keep
+  # only the newest 60 nightly-* versions. The dbt package is repo-linked and
+  # workflow-published, so the default GITHUB_TOKEN (packages: write) can
+  # delete versions via the Packages API.
+  cleanup-tags:
+    needs: [resolve, publish-manifests]
+    if: needs.resolve.outputs.kind == 'nightly'
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/${{ github.repository_owner }}/dbt-rock-builder:v1
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: prune pr-* tags and old nightly-* versions
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: bash scripts/cleanup-tags.sh "${IMAGE##*/}" nightly 60
+
   # One summary comment per PR run (updated in place on re-runs), instead of
   # one comment per matrix job.
   summarize:
@@ -263,6 +316,11 @@ jobs:
     # fork PRs get a read-only token and cannot be commented on
     if: always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/${{ github.repository_owner }}/dbt-rock-builder:v1
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -283,7 +341,8 @@ jobs:
           else
             status="⚠️ ${ok}/${total} build/push jobs passed; failed: ${failed:-—}"
           fi
-          variants=$(paste -sd', ' scripts/variants.txt)
+          # NB: paste -d cycles through the delimiter CHARACTERS, so -sd', ' alternates , and space
+          variants=$(paste -sd, scripts/variants.txt | sed 's/,/, /g')
           body="dbt ${DBT_VERSION} rock build summary: ${status}
 
           Variants: ${variants} × amd64/arm64.

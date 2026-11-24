@@ -1,0 +1,116 @@
+# Build and push the shared CI builder image (builder/Dockerfile) to GHCR.
+#
+# build.yml, release.yml and upstream-release.yml run their jobs inside this
+# image, so no step has to apt/snap-install tools on the runner anymore. That
+# removes the flaky `snap install rockcraft` step (when snapd self-refreshes
+# mid-install the snap CLI dies with "Waiting for automatic snapd restart..."
+# / "The operation was canceled.") and gives every job pinned tool versions:
+# rockcraft 1.x (vendored from its snap, since rockcraft 1.x has no OCI image),
+# the umoci/skopeo binaries bundled in that snap, docker/gh CLIs, jq,
+# shellcheck and actionlint.
+#
+# The image is versioned separately from the dbt rocks, as its own GHCR
+# package `dbt-rock-builder`:
+#   v1       mutable major tag, rebuilt on every push to main that touches
+#            builder/** or this workflow — this is the tag the workflows use
+#   latest   alias of v1
+#   sha-<n>  immutable tag pinned to the commit that built the image (rollback)
+# On pull requests the image is only built (amd64) and smoke-tested, not
+# pushed.
+#
+# Bootstrap: the workflows reference :v1, which exists only after the first
+# build. To validate a PR that changes the builder before that, run this
+# workflow manually on the PR branch (Actions -> builder-image -> Run
+# workflow -> pick the branch) — it pushes :v1 from that branch.
+name: builder-image
+
+on:
+  push:
+    branches: [main] # keep in sync with the repo's default branch
+    paths:
+      - builder/**
+      - .github/workflows/builder-image.yml
+  pull_request:
+    paths:
+      - builder/**
+      - .github/workflows/builder-image.yml
+  workflow_dispatch:
+
+concurrency:
+  group: builder-image-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+# run steps execute with bash — job containers default to sh (dash)
+defaults:
+  run:
+    shell: bash
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/dbt-rock-builder
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      # docker actions at majors that run on Node.js 24 (v3/v5/v6 majors are
+      # Node 20 and trigger deprecation warnings on the runners)
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=v1,enable=${{ github.event_name != 'pull_request' }}
+            type=raw,value=latest,enable=${{ github.event_name != 'pull_request' }}
+            type=sha,prefix=sha-,format=short
+      # main / workflow_dispatch: build both arches and push v1 + latest + sha-<n>
+      - name: build + push multi-arch
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v7
+        with:
+          context: builder
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            ROCKCRAFT_CHANNEL=latest/stable
+      # pull requests: build the host arch only, no push — just validate the
+      # Dockerfile and smoke-test the tools
+      - name: build amd64 (no push)
+        if: github.event_name == 'pull_request'
+        uses: docker/build-push-action@v7
+        with:
+          context: builder
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: ${{ env.IMAGE }}:pr-${{ github.event.pull_request.number }}
+      - name: smoke test the image
+        if: github.event_name == 'pull_request'
+        run: |
+          docker run --rm "${IMAGE}:pr-${{ github.event.pull_request.number }}" bash -ec '
+            rockcraft --version
+            skopeo --version
+            umoci --version
+            snap download pebble --channel latest/stable >/dev/null && ls pebble_*.snap && rm -f pebble_*.snap
+            gh version | head -n 1
+            docker --version
+            jq --version
+            shellcheck --version | sed -n 2p
+            actionlint --version
+            cat /usr/local/share/dbt-rock-builder.txt
+          '
