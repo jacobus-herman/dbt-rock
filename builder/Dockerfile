@@ -39,6 +39,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl git jq shellcheck squashfs-tools tar xz-utils \
     && rm -rf /var/lib/apt/lists/*
 
+# The runner bind-mounts the workspace into the job container owned by the
+# runner uid, while the container runs as root — git then refuses the repo
+# ("detected dubious ownership") for every git/gh call in a step. The
+# container is an ephemeral CI sandbox, so allow any repo path for root.
+RUN git config --global --add safe.directory '*'
+
 # docker CLI (static build) — talks to the host daemon through the
 # /var/run/docker.sock that the Actions runner mounts into job containers.
 # NB: download.docker.com uses x86_64/aarch64, not amd64/arm64.
