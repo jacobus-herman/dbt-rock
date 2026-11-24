@@ -25,6 +25,11 @@ permissions:
   contents: write
   pull-requests: write
 
+# run steps execute with bash — job containers default to sh (dash)
+defaults:
+  run:
+    shell: bash
+
 env:
   BASE: ${{ github.event.repository.default_branch }}
   # Both jobs run inside the shared builder image

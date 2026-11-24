@@ -39,6 +39,12 @@ permissions:
   actions: write # required for upload-artifact/download-artifact; any declared
                   # permissions block sets all undeclared ones to "none"
 
+# run steps execute with bash — job containers default to sh (dash), and some
+# steps use bash features (here-strings, arrays)
+defaults:
+  run:
+    shell: bash
+
 env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/dbt
   # Every job below runs inside the shared builder image
