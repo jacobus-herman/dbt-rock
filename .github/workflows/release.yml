@@ -131,7 +131,16 @@ jobs:
             | jq -r --arg p "pr-${PR_NUMBER}-" '.Tags[] | select(startswith($p)) | select(endswith("-amd64"))
                       | sub("^" + $p; "") | sub("-amd64$"; "")' | sort -u)
           if [ -z "$variants" ]; then
-            echo "no pr-${PR_NUMBER}-* images found in ${IMAGE} — did the build workflow run?" >&2
+            # idempotency: a previous run may have promoted the version manifests
+            # already and deleted the pr-* tags before failing at a later step
+            existing=$(skopeo list-tags "docker://${IMAGE}" \
+              | jq -r --arg v "${V}-" '.Tags[] | select(startswith($v)) | select(endswith("-amd64"))
+                          | sub("^" + $v; "") | sub("-amd64$"; "")' | sort -u)
+            if [ -n "$existing" ]; then
+              echo "pr-${PR_NUMBER}-* images are gone but ${V}-* manifests already exist for: $existing — promotion already done, skipping"
+              exit 0
+            fi
+            echo "no pr-${PR_NUMBER}-* images found in ${IMAGE} and no ${V}-* manifests either — did the build workflow run?" >&2
             exit 1
           fi
           echo "variants: $variants"
