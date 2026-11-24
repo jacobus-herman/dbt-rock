@@ -291,9 +291,11 @@ jobs:
 
   # GHCR has no native retention UI, so prune here: delete pr-* tags of
   # closed/merged PRs (stale orphans included; open PRs are kept) and keep
-  # only the newest 60 nightly-* versions. The dbt package is repo-linked and
-  # workflow-published, so the default GITHUB_TOKEN (packages: write) can
-  # delete versions via the Packages API.
+  # only the newest 60 nightly-* versions. The dbt package must be linked to
+  # this repository (package settings -> Connect repository) for the default
+  # GITHUB_TOKEN (packages: write) to manage it via the Packages API;
+  # cleanup-tags.sh uses the owner-scoped /users/<owner>/packages endpoint
+  # because the repo-scoped one 404s for user-namespace packages.
   cleanup-tags:
     needs: [resolve, publish-manifests]
     if: needs.resolve.outputs.kind == 'nightly'

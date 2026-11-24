@@ -24,9 +24,14 @@ Implemented as four workflows:
   `<version>-<variant>` manifests, seeds `latest-<variant>` from them, creates
   the git tag and GitHub release. The temporary `pr-<n>` image tags are
   deleted via the Packages REST API with the default `GITHUB_TOKEN` (GHCR has
-  no registry DELETE endpoint, so `skopeo delete` fails with "unsupported";
-  the dbt package is repo-linked and workflow-published, so the repository has
-  admin on it and the token may delete versions). Idempotent: skips when the
+  no registry DELETE endpoint, so `skopeo delete` fails with "unsupported").
+  This requires the dbt GHCR package to be **linked to the repository**
+  (one-time setup: package page → Settings → Repository → Connect repository →
+  this repo; release.yml has a preflight step that fails fast if not). Because
+  the package lives in a user namespace, the script must use the owner-scoped
+  endpoint `/users/<owner>/packages/container/<pkg>/versions` — the repo-scoped
+  `/repos/<owner>/<repo>/packages/...` 404s for user-namespace packages even
+  when linked. Idempotent: skips when the
   version tag already exists. The nightly scheduled run is unaffected — it
   lives in build.yml.
 - GHCR has no native retention UI, so `build.yml`'s nightly run also prunes
