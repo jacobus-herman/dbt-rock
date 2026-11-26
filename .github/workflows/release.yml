@@ -82,8 +82,8 @@ jobs:
             echo "::error::the RELEASE_TOKEN repo secret is not set — add a PAT (classic: repo + write:packages; or fine-grained: Contents + Packages read/write on this repo) whose owner is on the tag ruleset's bypass list." >&2
             exit 1
           fi
-      # token + default persist-credentials make the later `git tag`/`git push`
-      # of the release tag authenticate with the PAT
+      # check out with the PAT so git reads (ls-remote in the skip step) and the
+      # tag ref creation in the release step authenticate as the PAT owner
       - uses: actions/checkout@v6
         with:
           token: ${{ secrets.RELEASE_TOKEN }}
@@ -206,8 +206,12 @@ jobs:
             echo "- \`${img}:latest-<variant>\` tracks the newest nightly build of the latest dbt version"
             echo "- Tarball and driver SHA256 checksums: \`/var/lib/dbt/provenance\` inside each image"
           } > /tmp/release-notes.md
-          # origin carries the PAT from checkout (persist-credentials), so the
-          # tag push runs as the ruleset bypass actor and is not rejected
-          git tag "$V" && git push origin "$V"
+          # Create the tag via the API with GH_TOKEN=RELEASE_TOKEN (job env), so
+          # the ref is created as the PAT owner — the ruleset bypass actor. A
+          # plain `git push` from the job container can authenticate as the
+          # GitHub Actions integration, which cannot bypass the tag ruleset on
+          # a personal repo (GH013 "creations being restricted").
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+            -f "ref=refs/tags/${V}" -f "sha=$(git rev-parse HEAD)"
           # GH_TOKEN is the PAT, so the release is created as the PAT owner
           gh release create "$V" --title "dbt-rock ${V}" --notes-file /tmp/release-notes.md
