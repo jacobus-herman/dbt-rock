@@ -22,6 +22,14 @@
 # the version tag already exists.
 # The .rock files are not attached to the GitHub release (22 rocks would exceed
 # asset limits) — pull them from ghcr instead.
+#
+# The whole workflow authenticates as a PAT (repo secret RELEASE_TOKEN — a
+# classic PAT with the repo + write:packages scopes, or a fine-grained PAT with
+# Contents: read/write + Packages: read/write on this repo) instead of the
+# default GITHUB_TOKEN: this is a personal
+# (user-owned) repo, where the GitHub Actions integration cannot be a bypass
+# actor on the tag ruleset — only the PAT owner (who must be on the ruleset's
+# bypass list) may push the release tag and create the GitHub release.
 name: release
 
 on:
@@ -58,13 +66,27 @@ jobs:
       image: ghcr.io/${{ github.repository_owner }}/dbt-rock-builder:v1
       credentials:
         username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
+        password: ${{ secrets.RELEASE_TOKEN }}
     env:
       PR_NUMBER_INPUT: ${{ github.event.inputs.pr_number }}
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # gh/git/ghcr all run as the PAT owner (the ruleset bypass actor), not as
+      # the GitHub Actions integration, which cannot bypass the tag ruleset on
+      # a personal repo.
+      GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+      RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
       GITHUB_REPOSITORY: ${{ github.repository }}
     steps:
+      - name: verify RELEASE_TOKEN is set
+        run: |
+          if [ -z "$RELEASE_TOKEN" ]; then
+            echo "::error::the RELEASE_TOKEN repo secret is not set — add a PAT (classic: repo + write:packages; or fine-grained: Contents + Packages read/write on this repo) whose owner is on the tag ruleset's bypass list." >&2
+            exit 1
+          fi
+      # token + default persist-credentials make the later `git tag`/`git push`
+      # of the release tag authenticate with the PAT
       - uses: actions/checkout@v6
+        with:
+          token: ${{ secrets.RELEASE_TOKEN }}
       - name: resolve which merged PR to release
         id: pr
         run: |
@@ -122,7 +144,7 @@ jobs:
         env:
           V: ${{ steps.ver.outputs.version }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
         run: |
           echo "$GITHUB_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
           echo "$GITHUB_TOKEN" | skopeo login ghcr.io -u "${{ github.actor }}" --password-stdin
@@ -184,5 +206,8 @@ jobs:
             echo "- \`${img}:latest-<variant>\` tracks the newest nightly build of the latest dbt version"
             echo "- Tarball and driver SHA256 checksums: \`/var/lib/dbt/provenance\` inside each image"
           } > /tmp/release-notes.md
+          # origin carries the PAT from checkout (persist-credentials), so the
+          # tag push runs as the ruleset bypass actor and is not rejected
           git tag "$V" && git push origin "$V"
+          # GH_TOKEN is the PAT, so the release is created as the PAT owner
           gh release create "$V" --title "dbt-rock ${V}" --notes-file /tmp/release-notes.md
