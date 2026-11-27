@@ -24,7 +24,7 @@ environment:
 parts:
   dbt:
     plugin: nil
-    source: .
+    source: scripts
     build-packages:
       - ca-certificates # HTTPS to the dbt CDN during install-drivers
       - curl
@@ -50,7 +50,6 @@ parts:
     # parameterised through env vars (DBT_VERSION, DBT_SHA256_AMD64/ARM64,
     # DBT_ADBC_DRIVERS), so a pipeline can build any dbt release without editing
     # this file. Only $CRAFT_PART_INSTALL is staged.
-    source: scripts
     override-build: |
       bash "$CRAFT_PART_BUILD/build.sh"
     # license texts under /usr/share/doc/*/copyright are
