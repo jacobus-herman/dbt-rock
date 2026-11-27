@@ -20,7 +20,7 @@
 # because the repo-scoped one 404s for user-namespace packages).
 # Which PR to release is the optional pr_number input; by default it picks the
 # newest merged PR that still has pr-* images in GHCR. Idempotent: skips when
-# the version tag already exists.
+# the version tag or a published release already exists.
 # The .rock files are not attached to the GitHub release (22 rocks would exceed
 # asset limits) — pull them from ghcr instead.
 #
@@ -97,13 +97,21 @@ jobs:
         run: |
           v=$(sed -n 's/^version:[[:space:]]*"\([^"]*\)".*/\1/p' rockcraft.yaml | head -n 1)
           echo "version=$v" >> "$GITHUB_OUTPUT"
-      - name: skip if the tag already exists
+      - name: skip if the tag or release already exists
         id: skip
         env:
           V: ${{ steps.ver.outputs.version }}
         run: |
           if git ls-remote --exit-code origin "refs/tags/${V}" >/dev/null 2>&1; then
-            echo "tag ${V} already released; nothing to do"
+            echo "tag ${V} already exists; nothing to do"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # a published release means the version is already out. A leftover
+          # draft is NOT a skip: the release step below replaces it, so a
+          # failed run can simply be re-run.
+          if [ "$(gh release view "$V" --json isDraft --jq .isDraft 2>/dev/null)" = false ]; then
+            echo "release ${V} already exists; nothing to do"
             echo "skip=true" >> "$GITHUB_OUTPUT"
           fi
       # Fail fast if the Packages API cannot see the package: the package must
