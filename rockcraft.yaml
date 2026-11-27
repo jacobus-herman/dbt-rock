@@ -45,11 +45,13 @@ parts:
       # writes /var/lib/chisel/manifest.yaml: the machine-readable record of
       # exactly which packages/slices were cut into this rock (SBOM/audit)
       - base-files_chisel
-    # Build logic lives in scripts/build.sh (pulled in via `source: .`) and is
+    # Build logic lives in scripts/build.sh (the part's only source, so local
+    # build dirs like out/ and parts/ are not copied into every build) and is
     # parameterised through env vars (DBT_VERSION, DBT_SHA256_AMD64/ARM64,
     # DBT_ADBC_DRIVERS), so a pipeline can build any dbt release without editing
-    # this file. The script itself is never staged: only $CRAFT_PART_INSTALL is.
+    # this file. Only $CRAFT_PART_INSTALL is staged.
+    source: scripts
     override-build: |
-      bash "$CRAFT_PART_BUILD/scripts/build.sh"
+      bash "$CRAFT_PART_BUILD/build.sh"
     # license texts under /usr/share/doc/*/copyright are
     # kept on purpose for license compliance/auditability (a few KB).

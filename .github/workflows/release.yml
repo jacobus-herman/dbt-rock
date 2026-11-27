@@ -66,7 +66,6 @@ jobs:
     env:
       PR_NUMBER_INPUT: ${{ github.event.inputs.pr_number }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      GITHUB_REPOSITORY: ${{ github.repository }}
     steps:
       - uses: actions/checkout@v6
       - name: resolve which merged PR to release
@@ -154,6 +153,11 @@ jobs:
             docker manifest annotate "${IMAGE}:${V}-${variant}" "${IMAGE}:pr-${PR_NUMBER}-${variant}-amd64" --os linux --arch amd64
             docker manifest annotate "${IMAGE}:${V}-${variant}" "${IMAGE}:pr-${PR_NUMBER}-${variant}-arm64" --os linux --arch arm64
             docker manifest push "${IMAGE}:${V}-${variant}"
+            # also tag the per-arch images with the version: the manifest list
+            # references them by digest, and the pr-* cleanup only deletes
+            # versions whose tags are ALL pr-*
+            skopeo copy "docker://${IMAGE}:pr-${PR_NUMBER}-${variant}-amd64" "docker://${IMAGE}:${V}-${variant}-amd64"
+            skopeo copy "docker://${IMAGE}:pr-${PR_NUMBER}-${variant}-arm64" "docker://${IMAGE}:${V}-${variant}-arm64"
             # seed latest-<variant> from the release manifest; the nightly build
             # re-points it at each new nightly of the version pinned on main.
             # NB: a manifest list cannot reference another manifest list via
