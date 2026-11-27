@@ -64,9 +64,6 @@ jobs:
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
-    outputs:
-      branch: ${{ steps.pr.outputs.branch }}
-      number: ${{ steps.pr.outputs.number }}
     env:
       DBT_VERSION: ${{ needs.check.outputs.dbt_version }}
       SHA_AMD64: ${{ needs.check.outputs.sha_amd64 }}
@@ -91,9 +88,8 @@ jobs:
           # identical-content commit (different sha), so a plain push is rejected
           git push -u origin "$branch" --force-with-lease
           # idempotent on re-runs: reuse the PR if this branch already has one
-          number=$(gh pr list --head "$branch" --base "${BASE}" --json number --jq '.[0].number // empty')
-          if [ -z "$number" ]; then
-            number=$(gh pr create --base "${BASE}" --head "$branch" \
+          if [ -z "$(gh pr list --head "$branch" --base "${BASE}" --json number --jq '.[0].number // empty')" ]; then
+            gh pr create --base "${BASE}" --head "$branch" \
               --title "Release dbt ${DBT_VERSION}" \
               --body "Automated bump of dbt OSS to ${DBT_VERSION}. The build workflow will pack one rock per ADBC driver variant x arch and push them as \`pr-<n>-<variant>-<arch>\` images; after merging, run the release workflow on main to publish the \`${DBT_VERSION}-<variant>\` manifests.
 
@@ -102,8 +98,5 @@ jobs:
               - arm64: ${SHA_ARM64}
 
               The build verifies the download against these and records them in
-              /var/lib/dbt/provenance." \
-              --json number --jq '.number')
+              /var/lib/dbt/provenance."
           fi
-          echo "branch=$branch" >> "$GITHUB_OUTPUT"
-          echo "number=$number" >> "$GITHUB_OUTPUT"

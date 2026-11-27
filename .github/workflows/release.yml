@@ -11,25 +11,21 @@
 # multi-arch manifests ghcr.io/<owner>/dbt:<version>-<variant> (no bare
 # <version> or :latest tag), seeds ghcr.io/<owner>/dbt:latest-<variant> from
 # them (the nightly build re-points latest-<variant> at each new nightly),
-# deletes the temporary pr-<n> tags via the Packages API (GHCR has no registry
-# DELETE endpoint; the package must be linked to this repository — checked by a
-# preflight step — so the default GITHUB_TOKEN with packages: write can delete
-# its versions; the script uses the owner-scoped /users/<owner>/packages API
-# because the repo-scoped one 404s for user-namespace packages), and
-# creates the git tag + GitHub release.
+# creates a draft GitHub release, deletes the temporary pr-<n> tags via the
+# Packages API and finally publishes the release, which creates the git tag
+# (the repo has immutable releases: a published release burns its tag name).
+# (GHCR has no registry DELETE endpoint; the package must be linked to this
+# repository — checked by a preflight step — so the GITHUB_TOKEN
+# (packages: write) can delete its versions; the script uses the owner-scoped /users/<owner>/packages API
+# because the repo-scoped one 404s for user-namespace packages).
 # Which PR to release is the optional pr_number input; by default it picks the
 # newest merged PR that still has pr-* images in GHCR. Idempotent: skips when
-# the version tag already exists.
+# the version tag or a published release already exists.
 # The .rock files are not attached to the GitHub release (22 rocks would exceed
 # asset limits) — pull them from ghcr instead.
 #
-# The whole workflow authenticates as a PAT (repo secret RELEASE_TOKEN — a
-# classic PAT with the repo + write:packages scopes, or a fine-grained PAT with
-# Contents: read/write + Packages: read/write on this repo) instead of the
-# default GITHUB_TOKEN: this is a personal
-# (user-owned) repo, where the GitHub Actions integration cannot be a bypass
-# actor on the tag ruleset — only the PAT owner (who must be on the ruleset's
-# bypass list) may push the release tag and create the GitHub release.
+# Authenticates with the default GITHUB_TOKEN: the tag ruleset only blocks
+# deleting/moving tags, so creating the release tag needs no bypass actor.
 name: release
 
 on:
@@ -66,27 +62,12 @@ jobs:
       image: ghcr.io/${{ github.repository_owner }}/dbt-rock-builder:v1
       credentials:
         username: ${{ github.actor }}
-        password: ${{ secrets.RELEASE_TOKEN }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     env:
       PR_NUMBER_INPUT: ${{ github.event.inputs.pr_number }}
-      # gh/git/ghcr all run as the PAT owner (the ruleset bypass actor), not as
-      # the GitHub Actions integration, which cannot bypass the tag ruleset on
-      # a personal repo.
-      GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
-      RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
-      GITHUB_REPOSITORY: ${{ github.repository }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - name: verify RELEASE_TOKEN is set
-        run: |
-          if [ -z "$RELEASE_TOKEN" ]; then
-            echo "::error::the RELEASE_TOKEN repo secret is not set — add a PAT (classic: repo + write:packages; or fine-grained: Contents + Packages read/write on this repo) whose owner is on the tag ruleset's bypass list." >&2
-            exit 1
-          fi
-      # check out with the PAT so git reads (ls-remote in the skip step) and the
-      # tag ref creation in the release step authenticate as the PAT owner
       - uses: actions/checkout@v6
-        with:
-          token: ${{ secrets.RELEASE_TOKEN }}
       - name: resolve which merged PR to release
         id: pr
         run: |
@@ -116,18 +97,26 @@ jobs:
         run: |
           v=$(sed -n 's/^version:[[:space:]]*"\([^"]*\)".*/\1/p' rockcraft.yaml | head -n 1)
           echo "version=$v" >> "$GITHUB_OUTPUT"
-      - name: skip if the tag already exists
+      - name: skip if the tag or release already exists
         id: skip
         env:
           V: ${{ steps.ver.outputs.version }}
         run: |
           if git ls-remote --exit-code origin "refs/tags/${V}" >/dev/null 2>&1; then
-            echo "tag ${V} already released; nothing to do"
+            echo "tag ${V} already exists; nothing to do"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # a published release means the version is already out. A leftover
+          # draft is NOT a skip: the release step below replaces it, so a
+          # failed run can simply be re-run.
+          if [ "$(gh release view "$V" --json isDraft --jq .isDraft 2>/dev/null)" = false ]; then
+            echo "release ${V} already exists; nothing to do"
             echo "skip=true" >> "$GITHUB_OUTPUT"
           fi
       # Fail fast if the Packages API cannot see the package: the package must
       # be linked to this repo (package page -> Settings -> Repository ->
-      # Connect repository) for GITHUB_TOKEN to manage it, and for a
+      # Connect repository) for the GITHUB_TOKEN to manage it, and for a
       # user-namespace package the owner-scoped endpoint /users/<owner>/... must
       # be used (the repo-scoped one 404s). cleanup-tags.sh does the same.
       - name: verify the GHCR package is accessible via the Packages API
@@ -135,7 +124,7 @@ jobs:
         run: |
           pkg="${IMAGE##*/}"; owner="${GITHUB_REPOSITORY%%/*}"
           if ! gh api "users/${owner}/packages/container/${pkg}/versions?per_page=1" >/dev/null 2>&1; then
-            echo "::error::cannot list versions of ghcr.io/${owner}/${pkg} — link the package to ${GITHUB_REPOSITORY} (package page -> Settings -> Repository -> Connect repository) so GITHUB_TOKEN may manage it, then re-run."
+            echo "::error::cannot list versions of ghcr.io/${owner}/${pkg} — link the package to ${GITHUB_REPOSITORY} (package page -> Settings -> Repository -> Connect repository) so the GITHUB_TOKEN may manage it, then re-run."
             exit 1
           fi
       - name: promote pr images to version-tagged multi-arch manifests
@@ -144,7 +133,7 @@ jobs:
         env:
           V: ${{ steps.ver.outputs.version }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
-          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "$GITHUB_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
           echo "$GITHUB_TOKEN" | skopeo login ghcr.io -u "${{ github.actor }}" --password-stdin
@@ -172,20 +161,17 @@ jobs:
             docker manifest annotate "${IMAGE}:${V}-${variant}" "${IMAGE}:pr-${PR_NUMBER}-${variant}-amd64" --os linux --arch amd64
             docker manifest annotate "${IMAGE}:${V}-${variant}" "${IMAGE}:pr-${PR_NUMBER}-${variant}-arm64" --os linux --arch arm64
             docker manifest push "${IMAGE}:${V}-${variant}"
+            # also tag the per-arch images with the version: the manifest list
+            # references them by digest, and the pr-* cleanup only deletes
+            # versions whose tags are ALL pr-*
+            skopeo copy "docker://${IMAGE}:pr-${PR_NUMBER}-${variant}-amd64" "docker://${IMAGE}:${V}-${variant}-amd64"
+            skopeo copy "docker://${IMAGE}:pr-${PR_NUMBER}-${variant}-arm64" "docker://${IMAGE}:${V}-${variant}-arm64"
             # seed latest-<variant> from the release manifest; the nightly build
             # re-points it at each new nightly of the version pinned on main.
             # NB: a manifest list cannot reference another manifest list via
             # `docker manifest create`, so copy the list as-is with skopeo
             skopeo copy --all "docker://${IMAGE}:${V}-${variant}" "docker://${IMAGE}:latest-${variant}"
           done
-      # GHCR does not support the registry DELETE endpoint (skopeo delete fails
-      # with "unsupported"), so pr-* tags are removed via the Packages API
-      # (owner-scoped endpoint; the package must be linked to this repo for
-      # GITHUB_TOKEN (packages: write) to manage it). Deletes all pr-* tags of
-      # closed/merged PRs (stale orphans included); tags of still-open PRs are kept.
-      - name: delete pr-* image tags via Packages API
-        if: steps.skip.outputs.skip != 'true'
-        run: bash scripts/cleanup-tags.sh "${IMAGE##*/}" pr
       - name: git tag + GitHub release
         if: steps.skip.outputs.skip != 'true'
         env:
@@ -206,12 +192,28 @@ jobs:
             echo "- \`${img}:latest-<variant>\` tracks the newest nightly build of the latest dbt version"
             echo "- Tarball and driver SHA256 checksums: \`/var/lib/dbt/provenance\` inside each image"
           } > /tmp/release-notes.md
-          # Create the tag via the API with GH_TOKEN=RELEASE_TOKEN (job env), so
-          # the ref is created as the PAT owner — the ruleset bypass actor. A
-          # plain `git push` from the job container can authenticate as the
-          # GitHub Actions integration, which cannot bypass the tag ruleset on
-          # a personal repo (GH013 "creations being restricted").
-          gh api -X POST "repos/${GITHUB_REPOSITORY}/git/refs" \
-            -f "ref=refs/tags/${V}" -f "sha=$(git rev-parse HEAD)"
-          # GH_TOKEN is the PAT, so the release is created as the PAT owner
-          gh release create "$V" --title "dbt-rock ${V}" --notes-file /tmp/release-notes.md
+          # Immutable releases reserve the tag name forever once published, so
+          # create a draft (the tag does not exist yet) and publish it as the
+          # last step. A draft left behind by a failed earlier run is replaced.
+          if [ "$(gh release view "$V" --json isDraft --jq .isDraft 2>/dev/null)" = true ]; then
+            gh release delete "$V" --yes
+          fi
+          gh release create "$V" --draft --target "$GITHUB_SHA" \
+            --title "dbt-rock ${V}" --notes-file /tmp/release-notes.md
+      # Runs after the draft release exists so a failure here never leaves a
+      # published release without its pr-* cleanup. GHCR has no registry DELETE endpoint (skopeo
+      # delete fails with "unsupported"), so pr-* tags are removed via the
+      # Packages API (owner-scoped endpoint; the package must be linked to this
+      # repo for the GITHUB_TOKEN (packages: write) to manage it). Deletes
+      # all pr-* tags of closed/merged PRs (stale orphans included); tags of
+      # still-open PRs are kept.
+      - name: delete pr-* image tags via Packages API
+        if: steps.skip.outputs.skip != 'true'
+        run: bash scripts/cleanup-tags.sh "${IMAGE##*/}" pr
+      # Last on purpose: publishing creates the tag and, with immutable
+      # releases, permanently reserves the version.
+      - name: publish release
+        if: steps.skip.outputs.skip != 'true'
+        env:
+          V: ${{ steps.ver.outputs.version }}
+        run: gh release edit "$V" --draft=false

@@ -37,8 +37,7 @@ permissions:
   contents: read
   pull-requests: write
   packages: write
-  actions: write # required for upload-artifact/download-artifact; any declared
-                  # permissions block sets all undeclared ones to "none"
+  actions: read # summarize lists the run's jobs via the API
 
 # run steps execute with bash — job containers default to sh (dash), and some
 # steps use bash features (here-strings, arrays)
@@ -109,7 +108,8 @@ jobs:
               echo "skip=false"
             else
               echo "kind=nightly"
-              echo "$GITHUB_TOKEN" | skopeo login ghcr.io -u "${{ github.actor }}" --password-stdin
+              # inside the >> $GITHUB_OUTPUT block below, so silence "Login Succeeded!"
+              echo "$GITHUB_TOKEN" | skopeo login ghcr.io -u "${{ github.actor }}" --password-stdin >/dev/null
               # ubuntu@26.04 -> docker://ubuntu:26.04
               base=$(sed -n 's/^build-base:[[:space:]]*//p' rockcraft.yaml)
               base_digest=$(skopeo inspect "docker://${base/@/:}" --format '{{.Digest}}')
@@ -164,6 +164,7 @@ jobs:
       DBT_ADBC_DRIVERS: ${{ matrix.variant }}
       # recorded in the image provenance on nightly builds
       DBT_BASE_DIGEST: ${{ needs.resolve.outputs.base_digest }}
+      TAG_PREFIX: ${{ needs.resolve.outputs.tag_prefix }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -192,70 +193,34 @@ jobs:
             --manifest.annotation "com.getdbt.adbc-driver=${DBT_ADBC_DRIVERS}"
           skopeo copy "oci:.rocklayout:${DBT_VERSION}" "oci-archive:${rock}:${DBT_VERSION}"
           rm -rf .rocklayout
-      - name: rename rock per variant
-        run: mv "out/dbt_${DBT_VERSION}_${{ matrix.arch }}.rock" "out/dbt_${DBT_VERSION}_${{ matrix.variant }}_${{ matrix.arch }}.rock"
+          mv "out/dbt_${DBT_VERSION}_${{ matrix.arch }}.rock" "out/dbt_${DBT_VERSION}_${{ matrix.variant }}_${{ matrix.arch }}.rock"
       - name: smoke test
         run: |
           read -ra drivers <<<"$DBT_ADBC_DRIVERS"
           bash scripts/smoke-test.sh "out/dbt_${DBT_VERSION}_${{ matrix.variant }}_${{ matrix.arch }}.rock" "$DBT_VERSION" "${drivers[@]}"
       # no per-job PR comment here — the summarize job posts a single summary
-      # upload-artifact maxes at v7; download-artifact v8 (push-images) reads
-      # any v4+ upload, so v7 upload + v8 download are compatible.
-      # NB: `with:` does NOT expand $VARS — only ${{ }} expressions — and
-      # if-no-files-found: error makes a missing rock fail this job instead of
-      # warning and letting push-images fail later with "artifact not found"
-      - uses: actions/upload-artifact@v7
-        with:
-          name: rock-${{ matrix.variant }}-${{ matrix.arch }}
-          path: out/dbt_${{ env.DBT_VERSION }}_${{ matrix.variant }}_${{ matrix.arch }}.rock
-          if-no-files-found: error
-
-  push-images:
-    needs: [resolve, build]
-    # fork PRs get a read-only token: build + smoke test only, no image push
-    if: needs.resolve.outputs.skip != 'true' && needs.build.result == 'success' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
-    strategy:
-      fail-fast: false
-      max-parallel: 6
-      matrix:
-        variant: ${{ fromJSON(needs.resolve.outputs.variants) }}
-        arch: [amd64, arm64]
-    runs-on: ubuntu-latest
-    container:
-      image: ghcr.io/${{ github.repository_owner }}/dbt-rock-builder:v1
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-    env:
-      DBT_VERSION: ${{ needs.resolve.outputs.version }}
-      TAG_PREFIX: ${{ needs.resolve.outputs.tag_prefix }}
-      KIND: ${{ needs.resolve.outputs.kind }}
-    steps:
-      - uses: actions/download-artifact@v8
-        with:
-          name: rock-${{ matrix.variant }}-${{ matrix.arch }}
-          path: rocks
+      # Fork PRs get a read-only token: build + smoke test only, no image push.
+      # .rock files are OCI archives, hence the oci-archive: transport.
       - name: push per-arch image
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "$GITHUB_TOKEN" | skopeo login ghcr.io -u "${{ github.actor }}" --password-stdin
           # PR builds: pr-<n>-... (no version tag; a manual release.yml run on
-          # main promotes them).
-          # Nightly builds: nightly-<yyyymmdd>-... (fresh base slices, version stays pinned).
-          # .rock files are OCI archives, hence the oci-archive: transport
-          skopeo copy "oci-archive:rocks/dbt_${DBT_VERSION}_${{ matrix.variant }}_${{ matrix.arch }}.rock" \
+          # main promotes them). Nightly builds: nightly-<yyyymmdd>-...
+          skopeo copy "oci-archive:out/dbt_${DBT_VERSION}_${{ matrix.variant }}_${{ matrix.arch }}.rock" \
             "docker://${IMAGE}:${TAG_PREFIX}-${{ matrix.variant }}-${{ matrix.arch }}"
           echo "pushed ${IMAGE}:${TAG_PREFIX}-${{ matrix.variant }}-${{ matrix.arch }}"
 
   # Nightly only: publish the multi-arch manifests after ALL arch cells of
-  # push-images finished (running this per-cell raced on the same tag and could
+  # build finished (running this per-cell raced on the same tag and could
   # reference a not-yet-pushed sibling arch). latest-<variant> points at the
   # newest nightly of the version pinned on main (a manual release.yml run on
   # main seeds it from the release manifest).
   publish-manifests:
-    needs: [resolve, push-images]
-    if: needs.resolve.outputs.kind == 'nightly' && needs.push-images.result == 'success'
+    needs: [resolve, build]
+    if: needs.resolve.outputs.kind == 'nightly' && needs.build.result == 'success'
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/${{ github.repository_owner }}/dbt-rock-builder:v1
@@ -276,7 +241,7 @@ jobs:
             | jq -r --arg p "${TAG_PREFIX}-" '.Tags[] | select(startswith($p)) | select(endswith("-amd64"))
                       | sub("^" + $p; "") | sub("-amd64$"; "")' | sort -u)
           if [ -z "$variants" ]; then
-            echo "no ${TAG_PREFIX}-* images found — did push-images run?" >&2
+            echo "no ${TAG_PREFIX}-* images found — did the build cells push?" >&2
             exit 1
           fi
           for variant in $variants; do
@@ -310,13 +275,12 @@ jobs:
       - name: prune pr-* tags and old nightly-* versions
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
         run: bash scripts/cleanup-tags.sh "${IMAGE##*/}" nightly 60
 
   # One summary comment per PR run (updated in place on re-runs), instead of
   # one comment per matrix job.
   summarize:
-    needs: [resolve, build, push-images]
+    needs: [resolve, build]
     # fork PRs get a read-only token and cannot be commented on
     if: always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
@@ -334,7 +298,7 @@ jobs:
       - name: post single summary comment on the PR
         run: |
           jobs=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs?per_page=100" \
-            --jq '[.jobs[] | select(.name | startswith("build (") or startswith("push-images (")) | {name, conclusion}]')
+            --jq '[.jobs[] | select(.name | startswith("build (")) | {name, conclusion}]')
           total=$(jq length <<<"$jobs")
           ok=$(jq '[.[] | select(.conclusion == "success")] | length' <<<"$jobs")
           failed=$(jq -r '[.[] | select(.conclusion != "success") | .name] | join(", ")' <<<"$jobs")

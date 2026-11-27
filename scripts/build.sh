@@ -15,7 +15,7 @@
 #                      no cached drivers.
 set -euo pipefail
 
-yaml_version=$(sed -n 's/^version:[[:space:]]*"\([^"]*\)".*/\1/p' "$CRAFT_PART_BUILD/rockcraft.yaml" | head -n 1)
+yaml_version=$(sed -n 's/^version:[[:space:]]*"\([^"]*\)".*/\1/p' "$CRAFT_PROJECT_DIR/rockcraft.yaml" | head -n 1)
 DBT_VERSION="${DBT_VERSION:-$yaml_version}"
 : "${DBT_VERSION:?set DBT_VERSION or keep version: in rockcraft.yaml}"
 # The git/URL tag keeps the "v", the tarball asset name drops it.

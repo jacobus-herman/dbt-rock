@@ -14,24 +14,30 @@ set -euo pipefail
 
 upstream="dbt-labs/dbt"
 
+# Resolve the two tarball checksums of a release tag from its SHA256SUMS;
+# sets sha_amd64/sha_arm64, exits if either is missing.
+shas_for() { # <tag> <version-without-v>
+  local sums
+  sums=$(curl -fsSL "https://github.com/${upstream}/releases/download/$1/SHA256SUMS")
+  sha_amd64=$(awk -v f="dbt-core-$2-x86_64-unknown-linux-gnu.tar.gz" '$2 == f {print $1}' <<<"$sums")
+  sha_arm64=$(awk -v f="dbt-core-$2-aarch64-unknown-linux-gnu.tar.gz" '$2 == f {print $1}' <<<"$sums")
+  if [ -z "$sha_amd64" ] || [ -z "$sha_arm64" ]; then
+    echo "tarball checksums not found in ${upstream} $1 SHA256SUMS" >&2
+    exit 1
+  fi
+}
+
 # Resolve just the tarball checksums for a given release tag (used by
 # build.yml on pull requests, where there is no check job to inherit them from):
 #   check-upstream.sh --shas v2.0.11   →  sha_amd64=... / sha_arm64=...
 if [ "${1:-}" = "--shas" ]; then
   t="${2:?usage: check-upstream.sh --shas <release-tag>}"
   v="${t#v}"
-  sums=$(curl -fsSL "https://github.com/${upstream}/releases/download/${t}/SHA256SUMS")
-  out="${GITHUB_OUTPUT:-/dev/stdout}"
-  sha_amd64=$(awk -v a="dbt-core-${v}-x86_64-unknown-linux-gnu.tar.gz" '$2 == a {print $1}' <<<"$sums")
-  sha_arm64=$(awk -v b="dbt-core-${v}-aarch64-unknown-linux-gnu.tar.gz" '$2 == b {print $1}' <<<"$sums")
-  if [ -z "$sha_amd64" ] || [ -z "$sha_arm64" ]; then
-    echo "tarball checksums not found in ${upstream} ${t} SHA256SUMS" >&2
-    exit 1
-  fi
+  shas_for "$t" "$v"
   {
     echo "sha_amd64=$sha_amd64"
     echo "sha_arm64=$sha_arm64"
-  } >> "$out"
+  } >> "${GITHUB_OUTPUT:-/dev/stdout}"
   exit 0
 fi
 
@@ -70,13 +76,7 @@ fi
 dbt_version="" sha_amd64="" sha_arm64=""
 if [ "$upgrade" = true ]; then
   dbt_version="v${latest}"
-  sums=$(curl -fsSL "https://github.com/${upstream}/releases/download/${dbt_version}/SHA256SUMS")
-  sha_amd64=$(awk -v f="dbt-core-${latest}-x86_64-unknown-linux-gnu.tar.gz" '$2 == f {print $1}' <<<"$sums")
-  sha_arm64=$(awk -v f="dbt-core-${latest}-aarch64-unknown-linux-gnu.tar.gz" '$2 == f {print $1}' <<<"$sums")
-  if [ -z "$sha_amd64" ] || [ -z "$sha_arm64" ]; then
-    echo "tarball checksums not found in ${upstream} ${dbt_version} SHA256SUMS" >&2
-    exit 1
-  fi
+  shas_for "$dbt_version" "$latest"
 fi
 
 out="${GITHUB_OUTPUT:-/dev/stdout}"
