@@ -35,11 +35,6 @@ on:
         description: 'Merged PR whose pr-<n>-* images to promote (default: newest merged PR that still has pr-* images in GHCR)'
         required: false
         type: string
-      # TEMP: test hook, remove together with the override in the version step
-      version:
-        description: 'TEMP test only: override the version from rockcraft.yaml (e.g. v0.0.0-test1)'
-        required: false
-        type: string
 
 concurrency:
   group: release # one release at a time; queue manual runs instead of cancelling
@@ -100,11 +95,8 @@ jobs:
           echo "number=$n" >> "$GITHUB_OUTPUT"
       - name: resolve version from rockcraft.yaml
         id: ver
-        env:
-          VERSION_OVERRIDE: ${{ github.event.inputs.version }} # TEMP: remove with the input
         run: |
           v=$(sed -n 's/^version:[[:space:]]*"\([^"]*\)".*/\1/p' rockcraft.yaml | head -n 1)
-          v="${VERSION_OVERRIDE:-$v}" # TEMP: remove with the input
           echo "version=$v" >> "$GITHUB_OUTPUT"
       - name: skip if the tag already exists
         id: skip
